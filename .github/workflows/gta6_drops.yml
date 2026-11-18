@@ -1,0 +1,64 @@
+name: GTA6 Sunset Drop 250h Marathon
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Çalışma Modu (run = Başlat/Devam Et, reset = Duraklatmayı Sıfırla)'
+        required: false
+        default: 'run'
+
+concurrency:
+  group: gta6-marathon-runner
+  cancel-in-progress: false
+
+jobs:
+  watch-gta6-drops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      TZ: Europe/Istanbul
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      KICK_COOKIES_JSON: ${{ secrets.KICK_COOKIES_JSON }}
+      TRIGGER_NAME: ${{ github.event_name }}
+      INPUT_ACTION: ${{ github.event.inputs.action }}
+
+    steps:
+      - name: Depoyu Çek (Checkout)
+        uses: actions/checkout@v4
+
+      - name: Maraton Durum Önbelleğini Yükle (Cache)
+        uses: actions/cache@v4
+        with:
+          path: marathon_state.json
+          key: gta6-state-${{ github.run_id }}
+          restore-keys: |
+            gta6-state-
+
+      - name: Hafif Ön Kontrol (Tamamlandı mı / Duraklatıldı mı?)
+        run: |
+          python3 gta6_cloud_bot.py --pre-check
+
+      - name: Python 3.11 Kurulumu
+        if: env.SKIP_BOT != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Playwright, Xvfb ve Bağımlılıkları Kur
+        if: env.SKIP_BOT != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libgbm-dev
+          pip install playwright requests
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: GTA VI Drops Maraton Botunu Başlat (Xvfb Sanal Ekran)
+        if: env.SKIP_BOT != 'true'
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" python3 -u gta6_cloud_bot.py
