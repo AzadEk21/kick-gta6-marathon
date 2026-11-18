@@ -448,13 +448,12 @@ def verify_channel_is_live_gta6(page, slug):
 # 5. DROPS SAYFASI TARAYICI (250 Saat Kalan Süre & Otomatik Claim)
 # ==============================================================================
 def scan_and_claim_gta6_drops(context, bot_ctx):
-    """kick.com/drops ve GTA VI drops sayfasını açar, SunsetK Badge kalan süresini okur ve varsa talep eder."""
+    """GTA VI drops sayfasını açar, SunsetK Badge kalan süresini ('Kilidi açmak için X sa. Y dk.') okur ve talep eder."""
     state = bot_ctx["state"]
     drop_page = None
     result_summary = "Drops sayfası taranamadı."
     try:
         drop_page = context.new_page()
-        # Doğrudan GTA VI Drops sekmesine git ki 1 saatlik başka oyun dropları karışmasın!
         drop_page.goto("https://kick.com/category/grand-theft-auto-vi/drops", wait_until="domcontentloaded", timeout=35000)
         drop_page.wait_for_timeout(5000)
 
@@ -483,7 +482,7 @@ def scan_and_claim_gta6_drops(context, bot_ctx):
             drop_page.close()
             return "Ödül talep edildi!"
 
-        # 2. Sayfadaki TÜM saat/dakika ifadelerini bul (1 saatlik yan dropları atlamak için Sunset Drop'a ait olanı seç)
+        # 2. Doğrudan konsolda yakaladığımız "Kilidi açmak için 247 sa. 12 dk." kalıbını veya en büyük saati yakala
         matches_tr = re.findall(r"(\d+)\s*sa\.?\s*(?:(\d+)\s*dk\.?)?", vis_text, re.IGNORECASE)
         matches_en = re.findall(r"(\d+)\s*h(?:r|ours?)?\s*(?:(\d+)\s*m(?:in)?)?", vis_text, re.IGNORECASE)
         all_matches = matches_tr if matches_tr else matches_en
@@ -494,10 +493,9 @@ def scan_and_claim_gta6_drops(context, bot_ctx):
         for h_str, m_str in all_matches:
             h = int(h_str)
             m = int(m_str) if m_str else 0
-            # Tam "250 sa. izle" başlığı değilse (veya altında dakika da varsa)
+            # "250 sa. izle" sabit başlığını atla, gerçek kalan süreyi (örn. 247 sa. 12 dk.) al
             if h <= 250 and not (h == 250 and m == 0 and len(all_matches) > 1):
                 tot = h * 60 + m
-                # 1 saatlik küçük dropları değil, SunsetK maraton süresini yakala
                 if best_rem_min is None or tot > best_rem_min:
                     best_rem_min = tot
                     rem_hours, rem_mins = h, m
