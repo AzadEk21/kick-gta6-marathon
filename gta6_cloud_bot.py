@@ -448,16 +448,16 @@ def verify_channel_is_live_gta6(page, slug):
 # 5. DROPS SAYFASI TARAYICI (250 Saat Kalan Süre & Otomatik Claim)
 # ==============================================================================
 def scan_and_claim_gta6_drops(context, bot_ctx):
-    """kick.com/drops sayfasını yeni sekmede açar, SunsetK Badge kalan süresini okur ve varsa talep eder."""
+    """kick.com/drops ve GTA VI drops sayfasını açar, SunsetK Badge kalan süresini okur ve varsa talep eder."""
     state = bot_ctx["state"]
     drop_page = None
     result_summary = "Drops sayfası taranamadı."
     try:
         drop_page = context.new_page()
-        drop_page.goto(GTA6_DROPS_URL, wait_until="domcontentloaded", timeout=35000)
+        # Doğrudan GTA VI Drops sekmesine git ki 1 saatlik başka oyun dropları karışmasın!
+        drop_page.goto("https://kick.com/category/grand-theft-auto-vi/drops", wait_until="domcontentloaded", timeout=35000)
         drop_page.wait_for_timeout(5000)
 
-        # Sunset Drop veya genel görünür metni çek
         vis_text = drop_page.evaluate("window.__GET_VISIBLE_TEXT__ ? window.__GET_VISIBLE_TEXT__() : document.body.innerText")
 
         # 1. Aktif "Talep et" / "Claim" butonu var mı kontrol et
@@ -483,30 +483,32 @@ def scan_and_claim_gta6_drops(context, bot_ctx):
             drop_page.close()
             return "Ödül talep edildi!"
 
-        # 2. "Kilidi açmak için 247 sa. 59 dk." veya "X hr Y min" kalıbını yakala
-        # Türkçe kalıp: (\d+)\s*sa\.?\s*(\d+)?\s*dk\.?
-        m_tr = re.search(r"(\d+)\s*sa\.?\s*(?:(\d+)\s*dk\.?)?", vis_text, re.IGNORECASE)
-        m_en = re.search(r"(\d+)\s*h(?:r|ours?)?\s*(?:(\d+)\s*m(?:in)?)?", vis_text, re.IGNORECASE)
+        # 2. Sayfadaki TÜM saat/dakika ifadelerini bul (1 saatlik yan dropları atlamak için Sunset Drop'a ait olanı seç)
+        matches_tr = re.findall(r"(\d+)\s*sa\.?\s*(?:(\d+)\s*dk\.?)?", vis_text, re.IGNORECASE)
+        matches_en = re.findall(r"(\d+)\s*h(?:r|ours?)?\s*(?:(\d+)\s*m(?:in)?)?", vis_text, re.IGNORECASE)
+        all_matches = matches_tr if matches_tr else matches_en
 
-        rem_hours = None
-        rem_mins = 0
-        if m_tr:
-            rem_hours = int(m_tr.group(1))
-            rem_mins = int(m_tr.group(2)) if m_tr.group(2) else 0
-        elif m_en:
-            rem_hours = int(m_en.group(1))
-            rem_mins = int(m_en.group(2)) if m_en.group(2) else 0
+        best_rem_min = None
+        rem_hours, rem_mins = None, 0
 
-        if rem_hours is not None and rem_hours <= 250:
-            total_rem_min = rem_hours * 60 + rem_mins
-            watched_min = max(0, 15000 - total_rem_min)
+        for h_str, m_str in all_matches:
+            h = int(h_str)
+            m = int(m_str) if m_str else 0
+            # Tam "250 sa. izle" başlığı değilse (veya altında dakika da varsa)
+            if h <= 250 and not (h == 250 and m == 0 and len(all_matches) > 1):
+                tot = h * 60 + m
+                # 1 saatlik küçük dropları değil, SunsetK maraton süresini yakala
+                if best_rem_min is None or tot > best_rem_min:
+                    best_rem_min = tot
+                    rem_hours, rem_mins = h, m
+
+        if rem_hours is not None:
+            watched_min = max(0, 15000 - best_rem_min)
             pct = round((watched_min / 15000.0) * 100, 2)
             state["remaining_text"] = f"{rem_hours} sa. {rem_mins} dk. (İzlenen: {watched_min // 60} sa {watched_min % 60} dk)"
             state["percent"] = pct
             save_state(state)
             result_summary = f"Kalan: {state['remaining_text']} (%{pct})"
-        else:
-            result_summary = f"Drops sayfası kontrol edildi. Mevcut: {state.get('remaining_text')}"
 
         drop_page.close()
     except Exception as e:
