@@ -1,31 +1,49 @@
-name: GTA6 Sunset Drop 250h Marathon
+name: GTA6_250h_Cloud_Marathon
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'
   workflow_dispatch:
-    inputs:
-      action:
-        description: 'Çalışma Modu (run = Başlat/Devam Et, reset = Duraklatmayı Sıfırla)'
-        required: false
-        default: 'run'
+  schedule:
+    - cron: '0 */5 * * *'
 
 concurrency:
-  group: gta6-marathon-runner
-  cancel-in-progress: false
+  group: gta6_250h_marathon_group
+  cancel-in-progress: true
 
 jobs:
-  watch-gta6-drops:
+  watch_gta6:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        # 5 FARKLI BULUT SUNUCUSU (5 Farklı IP + 5 Ayrı Tarayıcı Oturumu)
+        worker_id: [1, 2, 3, 4, 5]
 
-    env:
-      TZ: Europe/Istanbul
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      KICK_COOKIES_JSON: ${{ secrets.KICK_COOKIES_JSON }}
-      TRIGGER_NAME: ${{ github.event_name }}
-      INPUT_ACTION: ${{ github.event.inputs.action }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies & Camoufox
+        run: |
+          pip install playwright requests camoufox[geoip]
+          playwright install firefox
+          python -m camoufox fetch
+
+      - name: Run Synchronized GTA 6 Worker (${{ matrix.worker_id }})
+        env:
+          KICK_COOKIES: ${{ secrets.KICK_COOKIES }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          WORKER_ID: ${{ matrix.worker_id }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python gta6_cloud_bot.py
 
     steps:
       - name: Depoyu Çek (Checkout)
