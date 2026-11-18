@@ -30,6 +30,8 @@ jobs:
 
       - name: Install Dependencies & Camoufox
         run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libgbm-dev
           pip install playwright requests camoufox[geoip]
           playwright install firefox
           python -m camoufox fetch
@@ -43,40 +45,4 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           WORKER_ID: ${{ matrix.worker_id }}
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python gta6_cloud_bot.py
-
-    steps:
-      - name: Depoyu Çek (Checkout)
-        uses: actions/checkout@v4
-
-      - name: Maraton Durum Önbelleğini Yükle (Cache)
-        uses: actions/cache@v4
-        with:
-          path: marathon_state.json
-          key: gta6-state-${{ github.run_id }}
-          restore-keys: |
-            gta6-state-
-
-      - name: Hafif Ön Kontrol (Tamamlandı mı / Duraklatıldı mı?)
-        run: |
-          python3 gta6_cloud_bot.py --pre-check
-
-      - name: Python 3.11 Kurulumu
-        if: env.SKIP_BOT != 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Playwright, Xvfb ve Bağımlılıkları Kur
-        if: env.SKIP_BOT != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb xauth libgbm-dev
-          pip install playwright requests
-          playwright install chromium
-          playwright install-deps chromium
-
-      - name: GTA VI Drops Maraton Botunu Başlat (Xvfb Sanal Ekran)
-        if: env.SKIP_BOT != 'true'
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" python3 -u gta6_cloud_bot.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python3 -u gta6_cloud_bot.py
