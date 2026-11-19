@@ -34,13 +34,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies & Playwright Firefox
+      - name: Install Dependencies & Patchright Chrome
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb xauth libgbm-dev
-          pip install playwright requests
-          playwright install firefox
-          playwright install-deps firefox
+          pip install patchright requests
+          patchright install chrome
 
       - name: Run Synchronized GTA 6 Worker (${{ matrix.worker_id }})
         env:
