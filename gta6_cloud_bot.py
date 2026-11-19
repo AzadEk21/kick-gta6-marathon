@@ -3,9 +3,10 @@ import re
 import sys
 import json
 import time
-import random
+import warnings
 import requests
-from datetime import datetime, timezone
+
+warnings.filterwarnings("ignore")
 
 # Camoufox varsa kullan, yoksa standart Playwright Firefox'a düş
 try:
@@ -18,12 +19,19 @@ except ImportError:
 # ==========================================
 # 1. ORTAM DEĞİŞKENLERİ & MATRIX WORKER AYARI
 # ==========================================
-KICK_COOKIES_RAW = os.environ.get("KICK_COOKIES", "").strip()
+# Olası tüm Secret isimlerini sırayla kontrol et
+KICK_COOKIES_RAW = (
+    os.environ.get("KICK_COOKIES", "").strip()
+    or os.environ.get("KICK_COOKIE", "").strip()
+    or os.environ.get("KICK_SESSION_TOKEN", "").strip()
+    or os.environ.get("SESSION_TOKEN", "").strip()
+)
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY", "").strip()
-WORKFLOW_FILE = "kick_gta6.yml"
+WORKFLOW_FILE = "gta6_drops.yml"
 
 # GitHub Actions Matrix Worker ID (1, 2, 3, 4, 5)
 WORKER_ID = str(os.environ.get("WORKER_ID", "1")).strip()
@@ -45,15 +53,12 @@ PRIORITY_SLUGS = [
 # ==========================================
 STEALTH_AND_RACE_JS = r"""
 (() => {
-    // 1. Sekme her zaman görünür ve odakta kalsın
     Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
     Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
     document.hasFocus = () => true;
 
-    // 2. Görünür metin okuma yardımcısı
     window.__GET_VISIBLE_TEXT__ = () => document.body ? document.body.innerText : "";
 
-    // 3. WebSocket Yakalayıcı & Milisaniyelik Senkron (00.000 ms) Race Condition Vurucu
     window.__CAPTURED_WS__ = null;
     window.__ACTIVE_CHANNEL_ID__ = null;
     window.__ACTIVE_LIVESTREAM_ID__ = null;
@@ -85,7 +90,6 @@ STEALTH_AND_RACE_JS = r"""
         const chId = window.__ACTIVE_CHANNEL_ID__;
         const lsId = window.__ACTIVE_LIVESTREAM_ID__;
 
-        // Standart Ping + Handshake + Watch paketi tam 00.000 milisaniyede ateşlenir
         try {
             if (chId) {
                 origSend.call(ws, JSON.stringify({
@@ -106,7 +110,6 @@ STEALTH_AND_RACE_JS = r"""
     function startMillisecondSyncLoop() {
         const scheduleNextZeroMs = () => {
             const now = Date.now();
-            // Bir sonraki 20.000 ms sınırına (00.000, 20.000, 40.000) kalan tam milisaniye
             const delay = 20000 - (now % 20000);
             setTimeout(() => {
                 fireSyncWatchPacket();
@@ -127,7 +130,7 @@ def load_state():
         "percent": 0.0,
         "completed": False,
         "current_streamer": "Yok",
-        "last_update_ offset": 0
+        "last_update_offset": 0
     }
     if os.path.exists(STATE_FILE):
         try:
@@ -160,7 +163,6 @@ def get_control_keyboard():
     }
 
 def tg_send(text, reply_markup=None, force=False):
-    """Sadece Lider Sunucu (Worker #1) Telegram'a mesaj atar (Spam önleme)."""
     if not IS_LEADER and not force:
         return
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -208,32 +210,38 @@ def send_screenshot(page, caption=""):
 # ==========================================
 def parse_and_load_cookies(context):
     if not KICK_COOKIES_RAW:
-        print("❌ KICK_COOKIES secret bulunamadı!")
+        print("❌ KICK_COOKIES / KICK_COOKIE / SESSION_TOKEN secret bulunamadı! GitHub Settings -> Secrets -> Actions kısmını kontrol et.")
         return False
+
     cookies_to_add = []
+    # 1. JSON formatında mı?
     try:
         raw_list = json.loads(KICK_COOKIES_RAW)
         if isinstance(raw_list, dict) and "cookies" in raw_list:
             raw_list = raw_list["cookies"]
-        for c in raw_list:
-            name = c.get("name")
-            value = c.get("value")
-            if not name or value is None:
-                continue
-            domain = c.get("domain", ".kick.com")
-            if "kick.com" not in domain:
-                continue
-            cookie_obj = {
-                "name": str(name),
-                "value": str(value),
-                "domain": domain if domain.startswith(".") else f".{domain}",
-                "path": c.get("path", "/"),
-                "secure": bool(c.get("secure", True)),
-                "httpOnly": bool(c.get("httpOnly", False)),
-                "sameSite": "Lax"
-            }
-            cookies_to_add.append(cookie_obj)
+        if isinstance(raw_list, list):
+            for c in raw_list:
+                name = c.get("name")
+                value = c.get("value")
+                if not name or value is None:
+                    continue
+                domain = c.get("domain", ".kick.com")
+                if "kick.com" not in domain:
+                    continue
+                cookies_to_add.append({
+                    "name": str(name),
+                    "value": str(value),
+                    "domain": domain if domain.startswith(".") else f".{domain}",
+                    "path": c.get("path", "/"),
+                    "secure": bool(c.get("secure", True)),
+                    "httpOnly": bool(c.get("httpOnly", False)),
+                    "sameSite": "Lax"
+                })
     except Exception:
+        pass
+
+    # 2. "key=val; key2=val2" formatında mı?
+    if not cookies_to_add and "=" in KICK_COOKIES_RAW:
         for part in KICK_COOKIES_RAW.split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
@@ -246,6 +254,17 @@ def parse_and_load_cookies(context):
                     "sameSite": "Lax"
                 })
 
+    # 3. Sadece ham session_token değeri mi?
+    if not cookies_to_add and len(KICK_COOKIES_RAW) > 10:
+        cookies_to_add.append({
+            "name": "session_token",
+            "value": KICK_COOKIES_RAW,
+            "domain": ".kick.com",
+            "path": "/",
+            "secure": True,
+            "sameSite": "Lax"
+        })
+
     if cookies_to_add:
         context.add_cookies(cookies_to_add)
         print(f"✅ [Worker #{WORKER_ID}] {len(cookies_to_add)} adet Kick çerezi yüklendi.")
@@ -253,13 +272,10 @@ def parse_and_load_cookies(context):
     return False
 
 # ==========================================
-# 5. AKTİF GTA VI YAYINCISI BULUCU (WORKER BAZLI DAĞITIM)
+# 5. AKTİF GTA VI YAYINCISI BULUCU
 # ==========================================
 def find_live_gta6_streamers(page):
-    """GTA VI kategorisindeki canlı yayıncıları bulur ve Worker ID'ye göre farklı kanala dağıtır."""
     live_list = []
-
-    # 1. Önce kategori sayfasındaki gerçek canlı yayın linklerini DOM'dan çek
     try:
         page.goto(GTA6_CATEGORY_URL, wait_until="domcontentloaded", timeout=35000)
         page.wait_for_timeout(4000)
@@ -282,7 +298,6 @@ def find_live_gta6_streamers(page):
     except Exception as e:
         print(f"[KATEGORİ TARAMA UYARISI] {e}")
 
-    # 2. Yedek olarak öncelikli yayıncıları API'den kontrol et
     if len(live_list) < 5:
         for slug in PRIORITY_SLUGS:
             if slug in live_list:
@@ -293,7 +308,7 @@ def find_live_gta6_streamers(page):
                         const r = await fetch('https://kick.com/api/v2/channels/{slug}');
                         if (!r.ok) return null;
                         const d = await r.json();
-                        return (d && d.livestream && d.livestream.is_live) ? {{id: d.id, ls_id: d.livestream.id}} : null;
+                        return (d && d.livestream && d.livestream.is_live) ? true : null;
                     }} catch(e) {{ return null; }}
                 }}""")
                 if res:
@@ -307,16 +322,14 @@ def find_live_gta6_streamers(page):
     return live_list
 
 def pick_streamer_for_worker(live_list, offset=0):
-    """Her Worker'ın farklı bir kanalı izlemesini sağlar (Worker 1 -> 0. kanal, Worker 2 -> 1. kanal...)."""
     w_idx = max(0, int(WORKER_ID) - 1)
     target_idx = (w_idx + offset) % len(live_list)
     return live_list[target_idx]
 
 # ==========================================
-# 6. GTA VI DROPS SAYFASI TARAYICI (SUNSETK BADGE)
+# 6. GTA VI DROPS SAYFASI TARAYICI
 # ==========================================
 def scan_and_claim_gta6_drops(context, bot_ctx):
-    """GTA VI drops sayfasını açar, SunsetK Badge kalan süresini ('Kilidi açmak için X sa. Y dk.') okur ve talep eder."""
     state = bot_ctx["state"]
     drop_page = None
     result_summary = "Drops sayfası taranamadı."
@@ -327,7 +340,6 @@ def scan_and_claim_gta6_drops(context, bot_ctx):
 
         vis_text = drop_page.evaluate("window.__GET_VISIBLE_TEXT__ ? window.__GET_VISIBLE_TEXT__() : document.body.innerText")
 
-        # 1. Aktif "Talep et" / "Claim" butonu var mı kontrol et
         claimed = drop_page.evaluate(r"""() => {
             const btns = Array.from(document.querySelectorAll('button'));
             for (const b of btns) {
@@ -350,7 +362,6 @@ def scan_and_claim_gta6_drops(context, bot_ctx):
             drop_page.close()
             return "Ödül talep edildi!"
 
-        # 2. "Kilidi açmak için 247 sa. 12 dk." kalıbını veya en büyük maraton saatini yakala
         matches_tr = re.findall(r"(\d+)\s*sa\.?\s*(?:(\d+)\s*dk\.?)?", vis_text, re.IGNORECASE)
         matches_en = re.findall(r"(\d+)\s*h(?:r|ours?)?\s*(?:(\d+)\s*m(?:in)?)?", vis_text, re.IGNORECASE)
         all_matches = matches_tr if matches_tr else matches_en
@@ -361,7 +372,6 @@ def scan_and_claim_gta6_drops(context, bot_ctx):
         for h_str, m_str in all_matches:
             h = int(h_str)
             m = int(m_str) if m_str else 0
-            # "250 sa. izle" sabit başlığını atla, gerçek kalan süreyi (örn. 247 sa. 12 dk.) al
             if h <= 250 and not (h == 250 and m == 0 and len(all_matches) > 1):
                 tot = h * 60 + m
                 if best_rem_min is None or tot > best_rem_min:
@@ -387,16 +397,14 @@ def scan_and_claim_gta6_drops(context, bot_ctx):
     return result_summary
 
 # ==========================================
-# 7. YAYIN OYNATICI & SENKRON KANAL BİLGİSİ BESLEYİCİ
+# 7. YAYIN OYNATICI & SENKRON KANAL BESLEYİCİ
 # ==========================================
 def open_stream_and_arm_sync(page, slug, state):
-    """Belirtilen yayıncıyı açar, video kalitesini 160p'ye çeker ve kanal ID'lerini senkron vurucuya yükler."""
     url = f"https://kick.com/{slug}"
     print(f"📺 [Worker #{WORKER_ID}] Yayın açılıyor: {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=35000)
     page.wait_for_timeout(4500)
 
-    # Yetişkin içerik / 18+ veya "İzlemeye başla" butonu varsa geç
     page.evaluate(r"""() => {
         document.querySelectorAll('button').forEach(b => {
             const t = (b.innerText || '').toLowerCase();
@@ -411,7 +419,6 @@ def open_stream_and_arm_sync(page, slug, state):
         }
     }""")
 
-    # Kanalın canlı olup olmadığını ve ID'lerini API'den çekip JS Race-Condition vurucusuna enjekte et
     ch_info = page.evaluate(f"""async () => {{
         try {{
             const r = await fetch('https://kick.com/api/v2/channels/{slug}');
@@ -431,7 +438,7 @@ def open_stream_and_arm_sync(page, slug, state):
     return ch_info
 
 # ==========================================
-# 8. TELEGRAM KOMUT DİNLEYİCİSİ (SADECE LİDER WORKER #1)
+# 8. TELEGRAM KOMUT DİNLEYİCİSİ (SADECE WORKER #1)
 # ==========================================
 def poll_telegram_commands(page, context, bot_ctx):
     if not IS_LEADER or not TELEGRAM_BOT_TOKEN:
@@ -490,7 +497,7 @@ def poll_telegram_commands(page, context, bot_ctx):
         pass
 
 # ==========================================
-# 9. OTOMATİK BAYRAK DEVRİ (SADECE LİDER WORKER #1)
+# 9. OTOMATİK BAYRAK DEVRİ (SADECE WORKER #1)
 # ==========================================
 def trigger_next_workflow():
     if not IS_LEADER or not GITHUB_TOKEN or not GITHUB_REPO:
@@ -530,14 +537,12 @@ def run_bot(browser):
 
     page = context.new_page()
 
-    # 1. Aktif GTA VI yayıncılarını bul ve bu Worker'a düşen kanalı seç
     live_list = find_live_gta6_streamers(page)
     my_slug = pick_streamer_for_worker(live_list, 0)
-    ch_info = open_stream_and_arm_sync(page, my_slug, state)
+    open_stream_and_arm_sync(page, my_slug, state)
 
-    # 2. Sadece Lider Sunucu (Worker #1) ilk Drops taramasını yapar ve Telegram bildirimi atar
     if IS_LEADER:
-        drop_summary = scan_and_claim_gta6_drops(context, bot_ctx)
+        scan_and_claim_gta6_drops(context, bot_ctx)
         start_msg = (
             f"🚀 <b>5'Lİ MATRIX SENKRON ORDUSU BAŞLATILDI!</b>\n\n"
             f"👑 <b>Worker #1 Kanalı:</b> <code>{my_slug}</code>\n"
@@ -550,17 +555,14 @@ def run_bot(browser):
     last_health_check = time.time()
     last_drops_scan = time.time()
 
-    # 3. 7/24 İzleme ve Senkronizasyon Döngüsü
     while (time.time() - bot_ctx["start_time"]) < MAX_RUN_SECONDS:
         if state.get("completed"):
             tg_send("🏆 <b>250 Saatlik GTA VI Ödülü Tamamlandı!</b> Bot durduruluyor.")
             break
 
-        # Lider sunucuysa her 4 saniyede bir Telegram komutlarını kontrol et
         if IS_LEADER:
             poll_telegram_commands(page, context, bot_ctx)
 
-        # Her 3 dakikada bir yayının hala canlı olup olmadığını ve videonun oynadığını kontrol et
         if (time.time() - last_health_check) > 180:
             last_health_check = time.time()
             try:
@@ -588,21 +590,19 @@ def run_bot(browser):
             except Exception as e:
                 print(f"[SAĞLIK KONTROLÜ UYARISI] {e}")
 
-        # Lider sunucu her 20 dakikada bir Drops ilerlemesini tarar ve ödül açıldıysa talep eder
         if IS_LEADER and (time.time() - last_drops_scan) > 1200:
             last_drops_scan = time.time()
             scan_and_claim_gta6_drops(context, bot_ctx)
 
         time.sleep(4)
 
-    # Süre dolduğunda Lider sunucu yeni 5'li orduyu ateşler
     if IS_LEADER and not state.get("completed"):
         trigger_next_workflow()
 
 def main():
     print(f"🔥 [GTA 6 CLOUD BOT - WORKER #{WORKER_ID}] Başlatılıyor (Lider: {IS_LEADER})...")
     if USE_CAMOUFOX:
-        with Camoufox(headless=False) as browser:
+        with Camoufox(headless=False, i_know_what_im_doing=True) as browser:
             run_bot(browser)
     else:
         with sync_playwright() as p:
