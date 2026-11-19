@@ -3,23 +3,20 @@ import re
 import sys
 import json
 import time
+import random
 import warnings
 import requests
 
 warnings.filterwarnings("ignore")
 
-# Camoufox varsa kullan, yoksa standart Playwright Firefox'a düş
 try:
-    from camoufox.sync_api import Camoufox
-    USE_CAMOUFOX = True
+    from patchright.sync_api import sync_playwright
 except ImportError:
     from playwright.sync_api import sync_playwright
-    USE_CAMOUFOX = False
 
 # ==========================================
 # 1. ORTAM DEĞİŞKENLERİ & MATRIX WORKER AYARI
 # ==========================================
-# Olası tüm Secret isimlerini sırayla kontrol et
 KICK_COOKIES_RAW = (
     os.environ.get("KICK_COOKIES", "").strip()
     or os.environ.get("KICK_COOKIE", "").strip()
@@ -33,12 +30,11 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY", "").strip()
 WORKFLOW_FILE = "gta6_drops.yml"
 
-# GitHub Actions Matrix Worker ID (1, 2, 3, 4, 5)
 WORKER_ID = str(os.environ.get("WORKER_ID", "1")).strip()
 IS_LEADER = (WORKER_ID == "1")
 
 STATE_FILE = f"gta6_state_w{WORKER_ID}.json"
-MAX_RUN_SECONDS = int(5.4 * 3600)  # 5 saat 24 dakika sonra bayrak devri
+MAX_RUN_SECONDS = int(5.4 * 3600)
 
 GTA6_CATEGORY_URL = "https://kick.com/category/grand-theft-auto-vi"
 GTA6_DROPS_URL = "https://kick.com/category/grand-theft-auto-vi/drops"
@@ -122,7 +118,59 @@ STEALTH_AND_RACE_JS = r"""
 """
 
 # ==========================================
-# 3. DURUM (STATE) & TELEGRAM YARDIMCILARI
+# 3. CLOUDFLARE TURNSTILE OTOMATİK GEÇİCİ
+# ==========================================
+def bypass_cloudflare(page, max_wait=20):
+    """Cloudflare doğrulama ekranı çıkarsa Turnstile kutusuna insan gibi tıklayıp geçer."""
+    for attempt in range(4):
+        try:
+            title = (page.title() or "").lower()
+            body = page.evaluate("() => document.body ? document.body.innerText.toLowerCase() : ''")
+            is_cf = (
+                "just a moment" in title
+                or "bir dakika" in title
+                or "güvenlik doğrulaması" in body
+                or "verify you are human" in body
+                or "gerçek kişi olduğunuzu" in body
+            )
+            if not is_cf:
+                return True
+
+            print(f"🛡️ [Worker #{WORKER_ID}] Cloudflare tespit edildi (Deneme {attempt + 1}/4), kutucuk aranıyor...")
+            page.wait_for_timeout(3000)
+
+            # Turnstile iframe veya widget konumunu bul
+            box = None
+            for frame in page.frames:
+                if "challenges.cloudflare.com" in (frame.url or ""):
+                    el = frame.frame_element()
+                    box = el.bounding_box()
+                    if box:
+                        break
+
+            if box:
+                # Kutucuk genelde iframe'in sol tarafındadır (x + 28, y + height/2)
+                tx = box["x"] + 28 + random.uniform(-3, 3)
+                ty = box["y"] + (box["height"] / 2) + random.uniform(-3, 3)
+                page.mouse.move(tx - 60, ty + 20, steps=10)
+                page.wait_for_timeout(random.randint(150, 350))
+                page.mouse.move(tx, ty, steps=12)
+                page.wait_for_timeout(random.randint(100, 250))
+                page.mouse.click(tx, ty)
+                print(f"🖱️ [Worker #{WORKER_ID}] Turnstile kutusuna tıklandı ({int(tx)}, {int(ty)}).")
+            else:
+                # Fallback: ekran görüntüsündeki standart Turnstile konumu
+                page.mouse.move(215, 295, steps=12)
+                page.mouse.click(215, 295)
+
+            page.wait_for_timeout(5000)
+        except Exception as e:
+            print(f"[CF BYPASS UYARI] {e}")
+            page.wait_for_timeout(2000)
+    return False
+
+# ==========================================
+# 4. DURUM (STATE) & TELEGRAM YARDIMCILARI
 # ==========================================
 def load_state():
     default_state = {
@@ -206,15 +254,14 @@ def send_screenshot(page, caption=""):
         print(f"[SCREENSHOT HATA] {e}")
 
 # ==========================================
-# 4. ÇEREZ (COOKIE) YÜKLEYİCİ
+# 5. ÇEREZ (COOKIE) YÜKLEYİCİ
 # ==========================================
 def parse_and_load_cookies(context):
     if not KICK_COOKIES_RAW:
-        print("❌ KICK_COOKIES / KICK_COOKIE / SESSION_TOKEN secret bulunamadı! GitHub Settings -> Secrets -> Actions kısmını kontrol et.")
+        print("❌ KICK_COOKIES_JSON secret bulunamadı!")
         return False
 
     cookies_to_add = []
-    # 1. JSON formatında mı?
     try:
         raw_list = json.loads(KICK_COOKIES_RAW)
         if isinstance(raw_list, dict) and "cookies" in raw_list:
@@ -240,7 +287,6 @@ def parse_and_load_cookies(context):
     except Exception:
         pass
 
-    # 2. "key=val; key2=val2" formatında mı?
     if not cookies_to_add and "=" in KICK_COOKIES_RAW:
         for part in KICK_COOKIES_RAW.split(";"):
             if "=" in part:
@@ -254,7 +300,6 @@ def parse_and_load_cookies(context):
                     "sameSite": "Lax"
                 })
 
-    # 3. Sadece ham session_token değeri mi?
     if not cookies_to_add and len(KICK_COOKIES_RAW) > 10:
         cookies_to_add.append({
             "name": "session_token",
@@ -272,13 +317,14 @@ def parse_and_load_cookies(context):
     return False
 
 # ==========================================
-# 5. AKTİF GTA VI YAYINCISI BULUCU
+# 6. AKTİF GTA VI YAYINCISI BULUCU
 # ==========================================
 def find_live_gta6_streamers(page):
     live_list = []
     try:
         page.goto(GTA6_CATEGORY_URL, wait_until="domcontentloaded", timeout=35000)
-        page.wait_for_timeout(4000)
+        bypass_cloudflare(page)
+        page.wait_for_timeout(3000)
         dom_slugs = page.evaluate(r"""() => {
             const ignore = new Set(['categories', 'category', 'drops', 'browse', 'following', 'search', 'dashboard', 'settings', 'terms', 'privacy']);
             const found = [];
@@ -327,7 +373,7 @@ def pick_streamer_for_worker(live_list, offset=0):
     return live_list[target_idx]
 
 # ==========================================
-# 6. GTA VI DROPS SAYFASI TARAYICI
+# 7. GTA VI DROPS SAYFASI TARAYICI
 # ==========================================
 def scan_and_claim_gta6_drops(context, bot_ctx):
     state = bot_ctx["state"]
@@ -336,7 +382,8 @@ def scan_and_claim_gta6_drops(context, bot_ctx):
     try:
         drop_page = context.new_page()
         drop_page.goto(GTA6_DROPS_URL, wait_until="domcontentloaded", timeout=35000)
-        drop_page.wait_for_timeout(5000)
+        bypass_cloudflare(drop_page)
+        drop_page.wait_for_timeout(4000)
 
         vis_text = drop_page.evaluate("window.__GET_VISIBLE_TEXT__ ? window.__GET_VISIBLE_TEXT__() : document.body.innerText")
 
@@ -397,13 +444,14 @@ def scan_and_claim_gta6_drops(context, bot_ctx):
     return result_summary
 
 # ==========================================
-# 7. YAYIN OYNATICI & SENKRON KANAL BESLEYİCİ
+# 8. YAYIN OYNATICI & SENKRON KANAL BESLEYİCİ
 # ==========================================
 def open_stream_and_arm_sync(page, slug, state):
     url = f"https://kick.com/{slug}"
     print(f"📺 [Worker #{WORKER_ID}] Yayın açılıyor: {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=35000)
-    page.wait_for_timeout(4500)
+    bypass_cloudflare(page)
+    page.wait_for_timeout(4000)
 
     page.evaluate(r"""() => {
         document.querySelectorAll('button').forEach(b => {
@@ -438,7 +486,7 @@ def open_stream_and_arm_sync(page, slug, state):
     return ch_info
 
 # ==========================================
-# 8. TELEGRAM KOMUT DİNLEYİCİSİ (SADECE WORKER #1)
+# 9. TELEGRAM KOMUT DİNLEYİCİSİ (SADECE WORKER #1)
 # ==========================================
 def poll_telegram_commands(page, context, bot_ctx):
     if not IS_LEADER or not TELEGRAM_BOT_TOKEN:
@@ -497,7 +545,7 @@ def poll_telegram_commands(page, context, bot_ctx):
         pass
 
 # ==========================================
-# 9. OTOMATİK BAYRAK DEVRİ (SADECE WORKER #1)
+# 10. OTOMATİK BAYRAK DEVRİ (SADECE WORKER #1)
 # ==========================================
 def trigger_next_workflow():
     if not IS_LEADER or not GITHUB_TOKEN or not GITHUB_REPO:
@@ -515,17 +563,13 @@ def trigger_next_workflow():
         print(f"[WORKFLOW TETİKLEME HATASI] {e}")
 
 # ==========================================
-# 10. ANA ÇALIŞMA DÖNGÜSÜ
+# 11. ANA ÇALIŞMA DÖNGÜSÜ
 # ==========================================
-def run_bot(browser):
-    context = browser.new_context(
-        viewport={"width": 1280, "height": 720},
-        locale="tr-TR"
-    )
+def run_bot(context):
     context.add_init_script(STEALTH_AND_RACE_JS)
 
     if not parse_and_load_cookies(context):
-        tg_send("❌ <b>HATA:</b> Kick çerezleri (KICK_COOKIES) okunamadı!")
+        tg_send("❌ <b>HATA:</b> Kick çerezleri (KICK_COOKIES_JSON) okunamadı!")
         return
 
     state = load_state()
@@ -535,7 +579,7 @@ def run_bot(browser):
         "stream_offset": 0
     }
 
-    page = context.new_page()
+    page = context.pages[0] if context.pages else context.new_page()
 
     live_list = find_live_gta6_streamers(page)
     my_slug = pick_streamer_for_worker(live_list, 0)
@@ -600,14 +644,18 @@ def run_bot(browser):
         trigger_next_workflow()
 
 def main():
-    print(f"🔥 [GTA 6 CLOUD BOT - WORKER #{WORKER_ID}] Başlatılıyor (Lider: {IS_LEADER})...")
-    if USE_CAMOUFOX:
-        with Camoufox(headless=False, i_know_what_im_doing=True) as browser:
-            run_bot(browser)
-    else:
-        with sync_playwright() as p:
-            browser = p.firefox.launch(headless=False)
-            run_bot(browser)
+    print(f"🔥 [GTA 6 CLOUD BOT - WORKER #{WORKER_ID}] Patchright Chrome ile başlatılıyor (Lider: {IS_LEADER})...")
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=f"/tmp/chrome_profile_w{WORKER_ID}",
+            channel="chrome",
+            headless=False,
+            viewport={"width": 1280, "height": 720},
+            locale="tr-TR",
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        run_bot(context)
+        context.close()
 
 if __name__ == "__main__":
     main()
