@@ -10,10 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  KICK_COOKIES: ${{ secrets.KICK_COOKIES }}
-  KICK_COOKIE: ${{ secrets.KICK_COOKIE }}
-  KICK_SESSION_TOKEN: ${{ secrets.KICK_SESSION_TOKEN }}
-  SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
+  KICK_COOKIES: ${{ secrets.KICK_COOKIES_JSON }}
   TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
   TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,13 +34,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies & Camoufox
+      - name: Install Dependencies & Playwright Firefox
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb xauth libgbm-dev
-          pip install playwright requests camoufox[geoip]
+          pip install playwright requests
           playwright install firefox
-          python -m camoufox fetch
+          playwright install-deps firefox
 
       - name: Run Synchronized GTA 6 Worker (${{ matrix.worker_id }})
         env:
