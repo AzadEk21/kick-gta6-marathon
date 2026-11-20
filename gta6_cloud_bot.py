@@ -130,10 +130,12 @@ def save_state(state):
 # ==========================================
 # 4. TELEGRAM API & UYGULAMA BENZERİ UI/UX
 # ==========================================
-def tg_api(method, data=None, files=None, timeout=25, retries=3):
+def tg_api(method, data=None, files=None, timeout=12, retries=2):
     if not TELEGRAM_BOT_TOKEN:
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+
+    # 1. Önce Python requests ile dene
     for attempt in range(1, retries + 1):
         try:
             r = requests.post(
@@ -141,15 +143,37 @@ def tg_api(method, data=None, files=None, timeout=25, retries=3):
                 data=data,
                 files=files,
                 headers={"Connection": "close"},
-                timeout=(10, timeout)
+                timeout=(8, timeout)
             )
             if r.ok:
                 return r.json()
+            log(f"[TG API RED - {method}] HTTP {r.status_code}: {r.text[:200]}")
+            return None
         except requests.exceptions.RequestException as e:
             if attempt == retries:
-                log(f"[TG API HATA - {method}] {e}")
+                log(f"[TG API TIMEOUT - {method}] requests başarısız, curl -4 deneniyor... ({e})")
             else:
-                time.sleep(2 * attempt)
+                time.sleep(1.5)
+
+    # 2. Yedek: Sistem curl -4 (HTTP/2 + libcurl) ile gönder
+    try:
+        cmd = ["curl", "-4", "-sS", "--max-time", "15", "-X", "POST", url]
+        if files:
+            for k, v in (data or {}).items():
+                cmd += ["-F", f"{k}={v}"]
+            for k, fobj in files.items():
+                cmd += ["-F", f"{k}=@{fobj.name}"]
+        else:
+            for k, v in (data or {}).items():
+                cmd += ["--data-urlencode", f"{k}={v}"]
+
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=20).decode("utf-8", errors="ignore")
+        res = json.loads(out)
+        if res.get("ok"):
+            return res
+        log(f"[TG CURL RED - {method}] {out[:200]}")
+    except Exception as e:
+        log(f"[TG CURL HATA - {method}] {e}")
     return None
 
 def setup_telegram_menu():
