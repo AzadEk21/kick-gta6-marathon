@@ -29,7 +29,10 @@ except ImportError:
 KICK_COOKIES_RAW = os.environ.get("KICK_COOKIES", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_API_BASE = (os.environ.get("TELEGRAM_PROXY_URL", "").strip().rstrip("/") or "https://api.telegram.org")
+_raw_proxy = os.environ.get("TELEGRAM_PROXY_URL", "").strip().strip('"').strip("'").rstrip("/")
+if _raw_proxy and not _raw_proxy.startswith(("http://", "https://")):
+    _raw_proxy = f"https://{_raw_proxy}"
+TELEGRAM_API_BASE = _raw_proxy or "https://api.telegram.org"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY", "").strip()
 
