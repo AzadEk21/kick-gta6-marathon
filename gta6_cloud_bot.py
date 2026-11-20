@@ -29,6 +29,7 @@ except ImportError:
 KICK_COOKIES_RAW = os.environ.get("KICK_COOKIES", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_API_BASE = (os.environ.get("TELEGRAM_PROXY_URL", "").strip().rstrip("/") or "https://api.telegram.org")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY", "").strip()
 
@@ -134,7 +135,7 @@ def save_state(state):
 def tg_api(method, data=None, files=None, timeout=12, retries=2):
     if not TELEGRAM_BOT_TOKEN:
         return None
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
     # 1. Önce Python requests ile dene
     for attempt in range(1, retries + 1):
@@ -189,7 +190,7 @@ def setup_telegram_menu():
     if TELEGRAM_BOT_TOKEN:
         try:
             requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands",
+                f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/setMyCommands",
                 json={"commands": commands},
                 timeout=10
             )
@@ -457,7 +458,7 @@ def telegram_listener_thread(state_ref, stop_event):
             continue
         try:
             r = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
                 params={"offset": offset + 1, "timeout": 10},
                 timeout=15
             )
