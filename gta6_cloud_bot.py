@@ -1,5 +1,4 @@
 import os
-import subprocess
 import re
 import sys
 import json
@@ -10,9 +9,6 @@ import threading
 import warnings
 import traceback
 import requests
-import socket
-import urllib3.util.connection
-urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
@@ -29,10 +25,6 @@ except ImportError:
 KICK_COOKIES_RAW = os.environ.get("KICK_COOKIES", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-_raw_proxy = os.environ.get("TELEGRAM_PROXY_URL", "").strip().strip('"').strip("'").rstrip("/")
-if _raw_proxy and not _raw_proxy.startswith(("http://", "https://")):
-    _raw_proxy = f"https://{_raw_proxy}"
-TELEGRAM_API_BASE = _raw_proxy or "https://api.telegram.org"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY", "").strip()
 
@@ -135,50 +127,16 @@ def save_state(state):
 # ==========================================
 # 4. TELEGRAM API & UYGULAMA BENZERİ UI/UX
 # ==========================================
-def tg_api(method, data=None, files=None, timeout=12, retries=2):
+def tg_api(method, data=None, files=None, timeout=15):
     if not TELEGRAM_BOT_TOKEN:
         return None
-    url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/{method}"
-
-    # 1. Önce Python requests ile dene
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.post(
-                url,
-                data=data,
-                files=files,
-                headers={"Connection": "close"},
-                timeout=(8, timeout)
-            )
-            if r.ok:
-                return r.json()
-            log(f"[TG API RED - {method}] HTTP {r.status_code}: {r.text[:200]}")
-            return None
-        except requests.exceptions.RequestException as e:
-            if attempt == retries:
-                log(f"[TG API TIMEOUT - {method}] requests başarısız, curl -4 deneniyor... ({e})")
-            else:
-                time.sleep(1.5)
-
-    # 2. Yedek: Sistem curl -4 (HTTP/2 + libcurl) ile gönder
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
-        cmd = ["curl", "-4", "-sS", "--max-time", "15", "-X", "POST", url]
-        if files:
-            for k, v in (data or {}).items():
-                cmd += ["-F", f"{k}={v}"]
-            for k, fobj in files.items():
-                cmd += ["-F", f"{k}=@{fobj.name}"]
-        else:
-            for k, v in (data or {}).items():
-                cmd += ["--data-urlencode", f"{k}={v}"]
-
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=20).decode("utf-8", errors="ignore")
-        res = json.loads(out)
-        if res.get("ok"):
-            return res
-        log(f"[TG CURL RED - {method}] {out[:200]}")
+        r = requests.post(url, data=data, files=files, timeout=timeout)
+        if r.ok:
+            return r.json()
     except Exception as e:
-        log(f"[TG CURL HATA - {method}] {e}")
+        log(f"[TG API HATA - {method}] {e}")
     return None
 
 def setup_telegram_menu():
@@ -193,7 +151,7 @@ def setup_telegram_menu():
     if TELEGRAM_BOT_TOKEN:
         try:
             requests.post(
-                f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/setMyCommands",
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands",
                 json={"commands": commands},
                 timeout=10
             )
@@ -461,7 +419,7 @@ def telegram_listener_thread(state_ref, stop_event):
             continue
         try:
             r = requests.get(
-                f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
                 params={"offset": offset + 1, "timeout": 10},
                 timeout=15
             )
