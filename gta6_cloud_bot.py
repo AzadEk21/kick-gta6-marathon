@@ -5,6 +5,7 @@ import json
 import time
 import random
 import warnings
+import traceback
 import requests
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -27,22 +28,34 @@ GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY", "").strip()
 
 WORKFLOW_FILE = "gta6_drops.yml"
 STATE_FILE = "marathon_state.json"
-MAX_RUN_SECONDS = int(5.4 * 3600)  # 5 saat 24 dakika sonra bayrak devri
+MAX_RUN_SECONDS = int(5.4 * 3600)  # 5 saat 24 dakika sonra normal bayrak devri
 TOTAL_TARGET_MINUTES = 250 * 60    # 15.000 dakika (250 saat)
 
+TR_TZ = timezone(timedelta(hours=3))
 GTA6_TR_CATEGORY_URL = "https://kick.com/category/grand-theft-auto-vi?sort=viewers_high_to_low&languages=tr"
 DROPS_CAMPAIGNS_URL = "https://kick.com/drops/campaigns"
 
 FALLBACK_SLUGS = ["rraenee", "eray", "mithrain", "hype", "elraenn", "cordiseps", "wtcn"]
 
-# Son 50 log satırını bellekte tut (/log komutu için)
 LOG_BUFFER = deque(maxlen=50)
 
+def now_tr():
+    return datetime.now(TR_TZ)
+
 def log(msg):
-    ts = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M:%S")
+    ts = now_tr().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     LOG_BUFFER.append(line)
+
+def format_viewers(count):
+    try:
+        c = int(count)
+        if c >= 1000:
+            return f"{c / 1000:.1f}K"
+        return str(c)
+    except Exception:
+        return "?"
 
 # ==========================================
 # 2. GÖRÜNÜRLÜK VE OYNATICI KORUMA SCRIPTI
@@ -60,6 +73,7 @@ VISIBILITY_JS = r"""
 # 3. KALICI HAFIZA (STATE) YÖNETİMİ
 # ==========================================
 def load_state():
+    today_str = now_tr().strftime("%Y-%m-%d")
     default_state = {
         "progress_ratio": 0.0,
         "percent": 0.0,
@@ -68,10 +82,18 @@ def load_state():
         "paused": False,
         "silent_mode": False,
         "current_streamer": "Yok",
+        "current_title": "Bilinmiyor",
+        "current_viewers": 0,
         "blacklist": [],
         "session_count": 0,
         "stuck_scans": 0,
-        "last_update_offset": 0
+        "last_update_offset": 0,
+        "last_scan_ts": 0.0,
+        "last_scan_ratio": 0.0,
+        "efficiency_text": "Hesaplanıyor...",
+        "last_daily_report_date": today_str,
+        "daily_start_ratio": 0.0,
+        "daily_channel_switches": 0
     }
     if os.path.exists(STATE_FILE):
         try:
@@ -90,10 +112,32 @@ def save_state(state):
         log(f"⚠️ State yazma hatası: {e}")
 
 # ==========================================
-# 4. TELEGRAM KONTROL PANELİ & BİLDİRİMLER
+# 4. TELEGRAM MENÜ, KLAVYE VE BİLDİRİMLER
 # ==========================================
+def setup_telegram_menu():
+    """Telegram sohbetindeki sol alt Menü (☰) butonuna tek tıkla komutları tanımlar."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
+    commands = [
+        {"command": "durum", "description": "📊 Anlık durum, yayın detayı ve verimlilik"},
+        {"command": "yayincilar", "description": "📺 Canlı Türkçe GTA VI yayıncılarını listele"},
+        {"command": "ekran", "description": "📸 Canlı yayın ekran görüntüsü al"},
+        {"command": "drops", "description": "🎁 SunsetK Badge ilerlemesini hemen tara"},
+        {"command": "degistir", "description": "🔄 Sonraki GTA VI yayıncısına geç"},
+        {"command": "log", "description": "📜 Botun son 25 çalışma kaydını gör"},
+        {"command": "sessiz", "description": "🔕 Sessiz modu aç/kapat"},
+        {"command": "restart", "description": "♻️ Yeni bulut sunucusu başlat"},
+        {"command": "durdur", "description": "🛑 Maratonu durdur"}
+    ]
+    try:
+        requests.post(url, json={"commands": commands}, timeout=10)
+        log("✅ Telegram sol alt menü komutları (setMyCommands) güncellendi.")
+    except Exception as e:
+        log(f"⚠️ setMyCommands hatası: {e}")
+
 def get_control_keyboard(silent_mode=False):
-    silent_label = "🔔 Sessiz Mod: AÇIK" if silent_mode else "🔕 Sessiz Mod: KAPALI"
+    silent_label = "🔔 Sessiz: AÇIK" if silent_mode else "🔕 Sessiz: KAPALI"
     return {
         "inline_keyboard": [
             [
@@ -101,19 +145,39 @@ def get_control_keyboard(silent_mode=False):
                 {"text": "📸 Ekran Görüntüsü", "callback_data": "/ekran"}
             ],
             [
-                {"text": "🎁 Drops Tara", "callback_data": "/drops"},
-                {"text": "🔄 Yayıncı Değiştir", "callback_data": "/degistir"}
+                {"text": "📺 Yayıncıları Listele", "callback_data": "/yayincilar"},
+                {"text": "🎁 Drops Tara", "callback_data": "/drops"}
             ],
             [
-                {"text": "📜 Son Loglar", "callback_data": "/log"},
-                {"text": silent_label, "callback_data": "/sessiz"}
+                {"text": "🔄 Yayıncı Değiştir", "callback_data": "/degistir"},
+                {"text": "📜 Son Loglar", "callback_data": "/log"}
             ],
             [
+                {"text": silent_label, "callback_data": "/sessiz"},
                 {"text": "♻️ Yeniden Başlat", "callback_data": "/restart"},
                 {"text": "🛑 Durdur", "callback_data": "/durdur"}
             ]
         ]
     }
+
+def build_streamers_keyboard(streamers_info):
+    """Canlı yayıncıları 2 sütunlu tıklanabilir butonlar halinde düzenler."""
+    rows = []
+    row = []
+    for item in streamers_info[:10]:
+        slug = item["slug"]
+        v_str = format_viewers(item.get("viewers", 0))
+        row.append({"text": f"🟢 {slug} ({v_str})", "callback_data": f"watch:{slug}"})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        {"text": "🔄 Listeyi Yenile", "callback_data": "/yayincilar"},
+        {"text": "🔙 Ana Menü", "callback_data": "/durum"}
+    ])
+    return {"inline_keyboard": rows}
 
 def tg_send(text, reply_markup=None, critical=False, state=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -160,8 +224,7 @@ def send_screenshot(page, caption="", critical=False, state=None):
         log(f"[SCREENSHOT HATA] {e}")
 
 def build_progress_bar(pct, length=10):
-    filled = int(round((pct / 100.0) * length))
-    filled = max(0, min(length, filled))
+    filled = max(0, min(length, int(round((pct / 100.0) * length))))
     return "█" * filled + "░" * (length - filled)
 
 def format_status_message(state, start_time):
@@ -169,23 +232,110 @@ def format_status_message(state, start_time):
     pct = state.get("percent", 0.0)
     bar = build_progress_bar(pct)
 
-    # Tahmini bitiş tarihi (TR saati)
     rem_min = max(0, int(round(TOTAL_TARGET_MINUTES * (1.0 - (pct / 100.0)))))
-    eta_dt = datetime.now(timezone(timedelta(hours=3))) + timedelta(minutes=rem_min)
+    eta_dt = now_tr() + timedelta(minutes=rem_min)
     eta_str = eta_dt.strftime("%d.%m.%Y %H:%M") if pct > 0 else "Hesaplanıyor..."
+
+    title = (state.get("current_title") or "Bilinmiyor")[:60]
+    viewers = format_viewers(state.get("current_viewers", 0))
+    eff = state.get("efficiency_text", "Hesaplanıyor...")
 
     return (
         f"🎮 <b>GTA VI 250 SAAT BULUT MARATONU</b>\n\n"
-        f"📺 <b>İzlenen Kanal:</b> <code>{state['current_streamer']}</code>\n"
+        f"📺 <b>Kanal:</b> <code>{state['current_streamer']}</code> (👁️ {viewers})\n"
+        f"📝 <b>Başlık:</b> <i>{title}</i>\n"
         f"🎁 <b>SunsetK Badge:</b> <code>{state['remaining_text']}</code>\n"
         f"📊 <b>İlerleme:</b> <code>[{bar}] %{pct:.2f}</code>\n"
+        f"📈 <b>Verimlilik:</b> <code>{eff}</code>\n"
         f"📅 <b>Tahmini Bitiş (TR):</b> <code>{eta_str}</code>\n"
-        f"🔁 <b>Toplam Oturum:</b> <code>#{state['session_count']}</code> | ⏱️ <b>Aktif:</b> <code>{elapsed_min} dk</code>\n\n"
-        f"<i>Komutlar: /izle kanal_adi | /engelle kanal_adi</i>"
+        f"🔁 <b>Oturum:</b> <code>#{state['session_count']}</code> | ⏱️ <b>Aktif:</b> <code>{elapsed_min} dk</code>"
     )
 
 # ==========================================
-# 5. ÇEREZ YÜKLEYİCİ & OTURUM SAĞLIK KONTROLÜ
+# 5. CLOUDFLARE TURNSTILE & AGRESİF KAYNAK ENGELLEYİCİ
+# ==========================================
+def bypass_cloudflare(page):
+    """Cloudflare doğrulama ekranı çıkarsa Turnstile kutusuna insan gibi tıklayıp geçer."""
+    for attempt in range(4):
+        try:
+            title = (page.title() or "").lower()
+            body = page.evaluate("() => document.body ? document.body.innerText.toLowerCase() : ''")
+            is_cf = (
+                "just a moment" in title
+                or "bir dakika" in title
+                or "güvenlik doğrulaması" in body
+                or "verify you are human" in body
+                or "gerçek kişi olduğunuzu" in body
+            )
+            if not is_cf:
+                return True
+
+            log(f"🛡️ Cloudflare tespit edildi (Deneme {attempt + 1}/4)...")
+            page.wait_for_timeout(3000)
+
+            box = None
+            for frame in page.frames:
+                if "challenges.cloudflare.com" in (frame.url or ""):
+                    el = frame.frame_element()
+                    box = el.bounding_box()
+                    if box:
+                        break
+
+            if box:
+                tx = box["x"] + 28 + random.uniform(-3, 3)
+                ty = box["y"] + (box["height"] / 2) + random.uniform(-3, 3)
+                page.mouse.move(tx - 60, ty + 20, steps=10)
+                page.wait_for_timeout(random.randint(150, 350))
+                page.mouse.move(tx, ty, steps=12)
+                page.wait_for_timeout(random.randint(100, 250))
+                page.mouse.click(tx, ty)
+                log(f"🖱️ Turnstile kutusuna tıklandı ({int(tx)}, {int(ty)}).")
+            else:
+                page.mouse.move(215, 295, steps=12)
+                page.mouse.click(215, 295)
+
+            page.wait_for_timeout(5000)
+        except Exception as e:
+            log(f"⚠️ CF Bypass uyarısı: {e}")
+            page.wait_for_timeout(2000)
+    return False
+
+def setup_resource_blocker(context):
+    """Video akışı, Cloudflare ve Kick API dışındaki ağır font, reklam ve görselleri engeller."""
+    blocked_domains = (
+        "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+        "facebook.net", "datadoghq.com", "sentry.io", "hotjar.com", "intercom.io"
+    )
+
+    def route_handler(route):
+        req = route.request
+        url = req.url.lower()
+        res_type = req.resource_type
+
+        # Cloudflare, canlı video akışı (IVS/HLS) ve Kick API'ye asla dokunma
+        if (
+            "challenges.cloudflare.com" in url
+            or "live-video.net" in url
+            or ".m3u8" in url
+            or ".ts" in url
+            or "kick.com/api/" in url
+            or "websockets.kick.com" in url
+        ):
+            route.continue_()
+            return
+
+        # Analitik / reklam izleyicilerini ve ağır font/görselleri kes
+        if any(d in url for d in blocked_domains) or res_type in ("font", "image"):
+            route.abort()
+            return
+
+        route.continue_()
+
+    context.route("**/*", route_handler)
+    log("🛡️ Agresif kaynak engelleyici (Image/Font/Tracker Blocker) aktif edildi.")
+
+# ==========================================
+# 6. ÇEREZ YÜKLEYİCİ & OTURUM KONTROLÜ
 # ==========================================
 def parse_and_load_cookies(context):
     if not KICK_COOKIES_RAW:
@@ -237,9 +387,8 @@ def parse_and_load_cookies(context):
     return False
 
 def check_session_authenticated(page):
-    """Kick hesabının gerçekten giriş yapmış durumda olduğunu kontrol eder."""
     try:
-        is_auth = page.evaluate(r"""() => {
+        return bool(page.evaluate(r"""() => {
             const html = document.documentElement.innerHTML || "";
             if (html.includes('"status":"authenticated"') || html.includes('session_token')) return true;
             const loginBtn = Array.from(document.querySelectorAll('button, a')).find(el => {
@@ -247,23 +396,23 @@ def check_session_authenticated(page):
                 return t === 'giriş yap' || t === 'log in';
             });
             return !loginBtn;
-        }""")
-        return bool(is_auth)
+        }"""))
     except Exception:
         return True
 
 # ==========================================
-# 6. TÜRKÇE GTA VI YAYINCISI BULUCU
+# 7. CANLI TÜRKÇE GTA VI YAYINCILARINI ÇEKME
 # ==========================================
-def find_tr_gta6_streamers(page, blacklist):
-    """En çok izlenen Türkçe GTA VI yayıncılarını çeker, engellileri eler."""
-    live_list = []
+def fetch_tr_gta6_streamers_detailed(page, blacklist):
+    """En çok izlenen 10 Türkçe GTA VI yayıncısını izleyici sayılarıyla birlikte döner."""
     bl_set = set(s.lower() for s in blacklist)
+    slugs = []
 
     try:
         log("🔍 Türkçe GTA VI yayıncıları taranıyor...")
         page.goto(GTA6_TR_CATEGORY_URL, wait_until="domcontentloaded", timeout=35000)
-        page.wait_for_timeout(4500)
+        bypass_cloudflare(page)
+        page.wait_for_timeout(4000)
 
         dom_slugs = page.evaluate(r"""() => {
             const ignore = new Set([
@@ -279,37 +428,61 @@ def find_tr_gta6_streamers(page, blacklist):
                     if (!ignore.has(s) && !found.includes(s)) found.push(s);
                 }
             });
-            return found.slice(0, 20);
+            return found.slice(0, 15);
         }""")
-
         for s in dom_slugs:
-            if s not in bl_set and s not in live_list:
-                live_list.append(s)
+            if s not in bl_set and s not in slugs:
+                slugs.append(s)
     except Exception as e:
-        log(f"⚠️ Kategori sayfası tarama uyarısı: {e}")
+        log(f"⚠️ Kategori tarama uyarısı: {e}")
 
-    # Liste boşsa yedek havuzdan canlı ve GTA VI oynayanları ekle
-    if not live_list:
-        for slug in FALLBACK_SLUGS:
-            if slug not in bl_set:
-                live_list.append(slug)
+    if not slugs:
+        slugs = [s for s in FALLBACK_SLUGS if s not in bl_set]
 
-    log(f"📋 Bulunan Türkçe GTA VI havuzu ({len(live_list)}): {', '.join(live_list[:6])}")
-    return live_list
+    detailed = []
+    for slug in slugs[:10]:
+        try:
+            info = page.evaluate(f"""async () => {{
+                try {{
+                    const r = await fetch('https://kick.com/api/v2/channels/{slug}');
+                    if (!r.ok) return null;
+                    const d = await r.json();
+                    if (d && d.livestream && d.livestream.is_live) {{
+                        return {{
+                            slug: '{slug}',
+                            viewers: d.livestream.viewer_count || 0,
+                            title: d.livestream.session_title || 'GTA VI'
+                        }};
+                    }}
+                    return null;
+                }} catch(e) {{ return null; }}
+            }}""")
+            if info:
+                detailed.append(info)
+        except Exception:
+            pass
+
+    if not detailed:
+        detailed = [{"slug": s, "viewers": 0, "title": "GTA VI"} for s in slugs[:5]]
+    else:
+        detailed.sort(key=lambda x: x["viewers"], reverse=True)
+
+    log(f"📋 Canlı Türkçe GTA VI havuzu ({len(detailed)}): {', '.join(x['slug'] for x in detailed[:5])}")
+    return detailed
 
 # ==========================================
-# 7. DROPS KAMPANYA TARAYICI (ARIA-VALUENOW HASSAS OKUMA)
+# 8. DROPS TARAYICI + ANLIK VERİMLİLİK ÖLÇER
 # ==========================================
 def scan_and_claim_drops(context, state):
-    """https://kick.com/drops/campaigns üzerinden SunsetK Badge ilerlemesini (aria-valuenow) okur ve ödülü talep eder."""
+    """https://kick.com/drops/campaigns üzerinden SunsetK Badge ilerlemesini okur ve verimliliği hesaplar."""
     drop_page = None
     summary = "Drops sayfası taranamadı."
     try:
         drop_page = context.new_page()
         drop_page.goto(DROPS_CAMPAIGNS_URL, wait_until="domcontentloaded", timeout=35000)
-        drop_page.wait_for_timeout(5500)
+        bypass_cloudflare(drop_page)
+        drop_page.wait_for_timeout(5000)
 
-        # 1. Aktif "Talep et" / "Claim" butonu varsa tıkla
         claimed = drop_page.evaluate(r"""() => {
             const btns = Array.from(document.querySelectorAll('button'));
             for (const b of btns) {
@@ -333,16 +506,13 @@ def scan_and_claim_drops(context, state):
             drop_page.close()
             return "Ödül talep edildi!"
 
-        # 2. Doğrudan SunsetK Badge <li> kartı içindeki role="progressbar" -> aria-valuenow değerini oku
         card_data = drop_page.evaluate(r"""() => {
             const items = Array.from(document.querySelectorAll('li'));
             for (const li of items) {
                 if ((li.innerText || '').includes('SunsetK Badge')) {
                     const bar = li.querySelector('[role="progressbar"]');
                     const valNow = bar ? (bar.getAttribute('aria-valuenow') || bar.getAttribute('data-value')) : null;
-                    const subtleSpan = li.querySelector('span.text-surface-fg-subtle');
-                    const remText = subtleSpan ? subtleSpan.innerText.trim() : '';
-                    return { valNow: valNow ? parseFloat(valNow) : null, remText: remText };
+                    return { valNow: valNow ? parseFloat(valNow) : null };
                 }
             }
             return null;
@@ -350,9 +520,23 @@ def scan_and_claim_drops(context, state):
 
         if card_data and card_data.get("valNow") is not None:
             ratio = float(card_data["valNow"])
+            now_ts = time.time()
             old_ratio = float(state.get("progress_ratio", 0.0))
+            last_ts = float(state.get("last_scan_ts", 0.0))
+            last_ratio = float(state.get("last_scan_ratio", 0.0))
 
-            # Süre ilerlemiyor kontrolü
+            # İlk kez taranıyorsa günlük başlangıç oranını kaydet
+            if state.get("daily_start_ratio", 0.0) == 0.0:
+                state["daily_start_ratio"] = ratio
+
+            # Anlık Verimlilik Hesabı (En az 5 dakika geçmişse hesapla)
+            if last_ts > 0 and (now_ts - last_ts) >= 300:
+                real_min = (now_ts - last_ts) / 60.0
+                gained_min = max(0.0, (ratio - last_ratio) * TOTAL_TARGET_MINUTES)
+                eff_pct = min(100, int(round((gained_min / real_min) * 100)))
+                icon = "🟢" if eff_pct >= 85 else ("🟡" if eff_pct >= 50 else "🔴")
+                state["efficiency_text"] = f"{icon} %{eff_pct} ({int(round(gained_min))}/{int(round(real_min))} dk)"
+
             if old_ratio > 0 and ratio <= old_ratio:
                 state["stuck_scans"] = state.get("stuck_scans", 0) + 1
             else:
@@ -366,10 +550,12 @@ def scan_and_claim_drops(context, state):
 
             state["progress_ratio"] = ratio
             state["percent"] = pct
+            state["last_scan_ts"] = now_ts
+            state["last_scan_ratio"] = ratio
             state["remaining_text"] = f"{rem_h} sa. {rem_m} dk. kaldı (İzlenen: {w_h} sa. {w_m} dk.)"
             save_state(state)
             summary = f"{state['remaining_text']} (%{pct:.2f})"
-            log(f"🎁 Drops güncellendi: {summary}")
+            log(f"🎁 Drops güncellendi: {summary} | Verimlilik: {state['efficiency_text']}")
         else:
             log("⚠️ SunsetK Badge progressbar DOM içinde bulunamadı.")
 
@@ -384,15 +570,16 @@ def scan_and_claim_drops(context, state):
     return summary
 
 # ==========================================
-# 8. YAYIN AÇICI, 160P AYARI & ENGEL TEMİZLEYİCİ
+# 9. YAYIN AÇICI, 160P, SOHBET KAPATICI & SAĞLIK KONTROLÜ
 # ==========================================
-def open_stream(page, slug, state):
+def open_stream(page, slug, state, count_switch=False):
     url = f"https://kick.com/{slug}"
     log(f"📺 Yayın açılıyor: {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=35000)
+    bypass_cloudflare(page)
     page.wait_for_timeout(4500)
 
-    # 18+ uyarıları, çerez pop-up'ları ve sessiz oynatma
+    # 18+ uyarıları, sessiz oynatma ve SOHBET KAPATICI (Hafif DOM Modu)
     page.evaluate(r"""() => {
         const keywords = ['start watching', 'izlemeye başla', '18+', 'kabul et', 'accept', 'onayla'];
         document.querySelectorAll('button').forEach(b => {
@@ -406,9 +593,19 @@ def open_stream(page, slug, state):
             v.muted = true;
             v.play().catch(() => {});
         }
+        // Sağdaki sohbet panelini gizle / DOM yükünü azalt
+        const chatSelectors = ['#channel-chatroom', '[data-testid="chatroom"]', 'aside'];
+        chatSelectors.forEach(sel => {
+            document.querySelectorAll(sel).forEach(el => {
+                if ((el.innerText || '').toLowerCase().includes('sohbet') || (el.innerText || '').toLowerCase().includes('chat') || sel.includes('chat')) {
+                    el.style.display = 'none';
+                    el.innerHTML = '';
+                }
+            });
+        });
     }""")
 
-    # 160p kaliteye düşürmeyi dene (RAM/CPU tasarrufu)
+    # 160p kaliteye düşür
     try:
         settings_btn = page.locator('button[aria-label*="Settings"], button[aria-label*="Ayarlar"]').first
         if settings_btn.is_visible(timeout=2000):
@@ -421,11 +618,33 @@ def open_stream(page, slug, state):
     except Exception:
         pass
 
+    # Canlı yayın başlığı ve izleyici sayısını çek
+    meta = page.evaluate(f"""async () => {{
+        try {{
+            const r = await fetch('https://kick.com/api/v2/channels/{slug}');
+            if (!r.ok) return null;
+            const d = await r.json();
+            if (d && d.livestream) {{
+                return {{
+                    viewers: d.livestream.viewer_count || 0,
+                    title: d.livestream.session_title || 'GTA VI'
+                }};
+            }}
+            return null;
+        }} catch(e) {{ return null; }}
+    }}""")
+
+    if count_switch and state.get("current_streamer") not in ("Yok", slug):
+        state["daily_channel_switches"] = state.get("daily_channel_switches", 0) + 1
+
     state["current_streamer"] = slug
+    if meta:
+        state["current_viewers"] = meta.get("viewers", 0)
+        state["current_title"] = meta.get("title", "GTA VI")
     save_state(state)
 
-def check_stream_health_and_category(page, slug, last_video_time):
-    """Yayın canlı mı, hala GTA VI mı oynuyor ve video donmuş mu kontrol eder."""
+def check_stream_health_and_category(page, state, last_video_time):
+    slug = state["current_streamer"]
     try:
         res = page.evaluate(f"""async () => {{
             const v = document.querySelector('video');
@@ -441,19 +660,28 @@ def check_stream_health_and_category(page, slug, last_video_time):
                 const isLive = Boolean(d && d.livestream && d.livestream.is_live);
                 const cats = (d && d.livestream && d.livestream.categories) ? d.livestream.categories : [];
                 const isGta6 = cats.some(c => (c.slug || '').includes('grand-theft-auto-vi') || (c.name || '').toLowerCase().includes('grand theft auto vi'));
-                return {{ ok: isLive, curTime: curTime, isGta6: isGta6 }};
+                return {{
+                    ok: isLive,
+                    curTime: curTime,
+                    isGta6: isGta6,
+                    viewers: d?.livestream?.viewer_count || 0,
+                    title: d?.livestream?.session_title || ''
+                }};
             }} catch(e) {{
                 return {{ ok: true, curTime: curTime, isGta6: true }};
             }}
         }}""")
 
-        is_live = res.get("ok", True)
-        is_gta6 = res.get("isGta6", True)
-        cur_time = res.get("curTime", -1)
+        if res.get("viewers"):
+            state["current_viewers"] = res["viewers"]
+        if res.get("title"):
+            state["current_title"] = res["title"]
+        save_state(state)
 
-        if not is_live:
+        cur_time = res.get("curTime", -1)
+        if not res.get("ok", True):
             return "offline", cur_time
-        if not is_gta6:
+        if not res.get("isGta6", True):
             return "wrong_game", cur_time
         if last_video_time > 0 and cur_time == last_video_time:
             return "frozen", cur_time
@@ -462,11 +690,39 @@ def check_stream_health_and_category(page, slug, last_video_time):
         return "healthy", last_video_time
 
 # ==========================================
-# 9. OTOMATİK BAYRAK DEVRİ (WORKFLOW DISPATCH)
+# 10. GÜNLÜK PERFORMANS ÖZETİ (00:00 TR RAPORU)
+# ==========================================
+def check_and_send_daily_report(state):
+    today_str = now_tr().strftime("%Y-%m-%d")
+    last_date = state.get("last_daily_report_date", today_str)
+    if today_str != last_date:
+        gained_ratio = max(0.0, state.get("progress_ratio", 0.0) - state.get("daily_start_ratio", 0.0))
+        gained_min = int(round(gained_ratio * TOTAL_TARGET_MINUTES))
+        g_h, g_m = gained_min // 60, gained_min % 60
+
+        rem_min = max(0, int(round((1.0 - state.get("progress_ratio", 0.0)) * TOTAL_TARGET_MINUTES)))
+        rem_days = round(rem_min / 1440.0, 1)
+
+        msg = (
+            f"🌙 <b>GÜNLÜK PERFORMANS ÖZETİ ({last_date})</b>\n\n"
+            f"⏱️ <b>Son 24 Saatte Kasılan:</b> <code>{g_h} sa. {g_m} dk.</code>\n"
+            f"🔄 <b>Kanal Değişimi:</b> <code>{state.get('daily_channel_switches', 0)} kez</code>\n"
+            f"📊 <b>Toplam İlerleme:</b> <code>%{state.get('percent', 0.0):.2f}</code>\n"
+            f"📅 <b>Hedefe Kalan Tahmini Gün:</b> <code>~{rem_days} gün</code>"
+        )
+        tg_send(msg, reply_markup=get_control_keyboard(state["silent_mode"]), critical=True, state=state)
+
+        state["last_daily_report_date"] = today_str
+        state["daily_start_ratio"] = state.get("progress_ratio", 0.0)
+        state["daily_channel_switches"] = 0
+        save_state(state)
+
+# ==========================================
+# 11. OTOMATİK BAYRAK DEVRİ (KATMAN 1 & 2)
 # ==========================================
 def trigger_next_workflow(state, reason="5.4 saatlik oturum tamamlandı"):
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        log("⚠️ GITHUB_TOKEN veya GITHUB_REPOSITORY eksik, bayrak devri yapılamadı.")
+        log("⚠️ GITHUB_TOKEN veya GITHUB_REPOSITORY eksik.")
         return False
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches"
     headers = {
@@ -484,7 +740,7 @@ def trigger_next_workflow(state, reason="5.4 saatlik oturum tamamlandı"):
     return False
 
 # ==========================================
-# 10. TELEGRAM KOMUT DİNLEYİCİSİ
+# 12. TELEGRAM KOMUT & BUTON DİNLEYİCİSİ
 # ==========================================
 def poll_telegram_commands(page, context, bot_ctx):
     if not TELEGRAM_BOT_TOKEN:
@@ -521,23 +777,41 @@ def poll_telegram_commands(page, context, bot_ctx):
             elif cmd.startswith("/ekran"):
                 send_screenshot(page, f"📸 <b>Canlı Ekran:</b> <code>{state['current_streamer']}</code>", critical=True, state=state)
 
+            elif cmd.startswith("/yayincilar"):
+                tg_send("🔍 <i>Canlı Türkçe GTA VI yayıncıları listeleniyor...</i>", critical=True, state=state)
+                detailed = fetch_tr_gta6_streamers_detailed(page, state["blacklist"])
+                # Kategori sayfasından sonra tekrar izlenen kanala dön
+                open_stream(page, state["current_streamer"], state, count_switch=False)
+                tg_send(
+                    "📺 <b>CANLI TÜRKÇE GTA VI YAYINCILARI</b>\nGeçmek istediğin yayıncıya tek tıkla:",
+                    reply_markup=build_streamers_keyboard(detailed),
+                    critical=True,
+                    state=state
+                )
+
+            elif cmd.startswith("watch:"):
+                target = raw_cmd.split(":", 1)[1].strip().lower()
+                if target:
+                    open_stream(page, target, state, count_switch=True)
+                    send_screenshot(page, f"✅ <b>Kanala Geçildi:</b> <code>{target}</code> (👁️ {format_viewers(state['current_viewers'])})", critical=True, state=state)
+
             elif cmd.startswith("/drops"):
                 tg_send("🔍 <i>Drops kampanyası taranıyor...</i>", critical=True, state=state)
                 summary = scan_and_claim_drops(context, state)
-                tg_send(f"🎁 <b>Güncel SunsetK Badge:</b>\n<code>{summary}</code>", reply_markup=get_control_keyboard(state["silent_mode"]), critical=True, state=state)
+                tg_send(f"🎁 <b>Güncel SunsetK Badge:</b>\n<code>{summary}</code>\n📈 <b>Verimlilik:</b> <code>{state['efficiency_text']}</code>", reply_markup=get_control_keyboard(state["silent_mode"]), critical=True, state=state)
 
             elif cmd.startswith("/degistir"):
-                streamers = find_tr_gta6_streamers(page, state["blacklist"])
-                bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(streamers)
-                new_slug = streamers[bot_ctx["stream_idx"]]
-                open_stream(page, new_slug, state)
-                tg_send(f"🔄 <b>Yayıncı Değiştirildi:</b> <code>{new_slug}</code>", reply_markup=get_control_keyboard(state["silent_mode"]), critical=True, state=state)
+                detailed = fetch_tr_gta6_streamers_detailed(page, state["blacklist"])
+                bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(detailed)
+                new_slug = detailed[bot_ctx["stream_idx"]]["slug"]
+                open_stream(page, new_slug, state, count_switch=True)
+                send_screenshot(page, f"🔄 <b>Yayıncı Değiştirildi:</b> <code>{new_slug}</code>", critical=True, state=state)
 
             elif cmd.startswith("/izle "):
                 target = raw_cmd.split(" ", 1)[1].strip().lower()
                 if target:
-                    open_stream(page, target, state)
-                    tg_send(f"🎯 <b>Özel Kanal Açıldı:</b> <code>{target}</code>", reply_markup=get_control_keyboard(state["silent_mode"]), critical=True, state=state)
+                    open_stream(page, target, state, count_switch=True)
+                    send_screenshot(page, f"🎯 <b>Özel Kanal Açıldı:</b> <code>{target}</code>", critical=True, state=state)
 
             elif cmd.startswith("/engelle "):
                 target = raw_cmd.split(" ", 1)[1].strip().lower()
@@ -546,8 +820,8 @@ def poll_telegram_commands(page, context, bot_ctx):
                     save_state(state)
                     tg_send(f"🚫 <code>{target}</code> kara listeye eklendi.", critical=True, state=state)
                     if state["current_streamer"] == target:
-                        streamers = find_tr_gta6_streamers(page, state["blacklist"])
-                        open_stream(page, streamers[0], state)
+                        detailed = fetch_tr_gta6_streamers_detailed(page, state["blacklist"])
+                        open_stream(page, detailed[0]["slug"], state, count_switch=True)
 
             elif cmd.startswith("/log"):
                 logs_text = "\n".join(list(LOG_BUFFER)[-25:]) or "Henüz log yok."
@@ -573,19 +847,12 @@ def poll_telegram_commands(page, context, bot_ctx):
         pass
 
 # ==========================================
-# 11. ANA ÇALIŞMA DÖNGÜSÜ
+# 13. ANA ÇALIŞMA DÖNGÜSÜ & KATMAN 2 KURTARMA
 # ==========================================
-def run_bot(context):
+def run_bot(context, state):
     context.add_init_script(VISIBILITY_JS)
-    state = load_state()
-
-    if state.get("completed"):
-        log("🏆 Ödül zaten tamamlanmış, çıkılıyor.")
-        return
-
-    state["paused"] = False
-    state["session_count"] = state.get("session_count", 0) + 1
-    save_state(state)
+    setup_resource_blocker(context)
+    setup_telegram_menu()
 
     if not parse_and_load_cookies(context):
         tg_send("❌ <b>KRİTİK HATA:</b> KICK_COOKIES_JSON okunamadı!", critical=True, state=state)
@@ -600,16 +867,12 @@ def run_bot(context):
 
     page = context.pages[0] if context.pages else context.new_page()
 
-    # 1. İlk Türkçe GTA VI yayıncısını seç ve aç
-    streamers = find_tr_gta6_streamers(page, state["blacklist"])
-    first_slug = streamers[0]
-    open_stream(page, first_slug, state)
+    detailed = fetch_tr_gta6_streamers_detailed(page, state["blacklist"])
+    open_stream(page, detailed[0]["slug"], state, count_switch=False)
 
-    # 2. Oturum / Çerez sağlık kontrolü
     if not check_session_authenticated(page):
-        send_screenshot(page, "⚠️ <b>KRİTİK UYARI:</b> Kick oturumu düşmüş görünüyor! Lütfen GitHub Secrets içindeki <code>KICK_COOKIES_JSON</code> değerini yenile.", critical=True, state=state)
+        send_screenshot(page, "⚠️ <b>KRİTİK UYARI:</b> Kick oturumu düşmüş görünüyor! Lütfen <code>KICK_COOKIES_JSON</code> secret değerini yenile.", critical=True, state=state)
 
-    # 3. İlk Drops taraması ve başlangıç bildirimi
     scan_and_claim_drops(context, state)
     send_screenshot(page, format_status_message(state, bot_ctx["start_time"]), state=state)
 
@@ -617,33 +880,33 @@ def run_bot(context):
     last_drops_scan = time.time()
     last_video_time = -1
 
-    # 4. 7/24 İzleme Döngüsü
     while (time.time() - bot_ctx["start_time"]) < MAX_RUN_SECONDS:
         if bot_ctx["force_exit"] or state.get("completed"):
             break
 
         poll_telegram_commands(page, context, bot_ctx)
+        check_and_send_daily_report(state)
 
-        # Her 3 dakikada bir yayın sağlığı, oyun kategorisi ve donma kontrolü
+        # Her 3 dakikada bir yayın sağlığı, kategori ve donma kontrolü
         if (time.time() - last_health_check) > 180:
             last_health_check = time.time()
-            status, last_video_time = check_stream_health_and_category(page, state["current_streamer"], last_video_time)
+            status, last_video_time = check_stream_health_and_category(page, state, last_video_time)
 
             if status in ("offline", "wrong_game"):
                 reason = "yayını kapattı" if status == "offline" else "GTA VI'dan başka oyuna geçti"
                 log(f"⚠️ {state['current_streamer']} {reason}, yeni kanala geçiliyor...")
-                streamers = find_tr_gta6_streamers(page, state["blacklist"])
-                bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(streamers)
-                open_stream(page, streamers[bot_ctx["stream_idx"]], state)
+                detailed = fetch_tr_gta6_streamers_detailed(page, state["blacklist"])
+                bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(detailed)
+                open_stream(page, detailed[bot_ctx["stream_idx"]]["slug"], state, count_switch=True)
                 last_video_time = -1
 
             elif status == "frozen":
-                log(f"❄️ {state['current_streamer']} oynatıcısı donmuş görünüyor, sayfa yenileniyor...")
+                log(f"❄️ {state['current_streamer']} oynatıcısı dondu, sayfa yenileniyor...")
                 page.reload(wait_until="domcontentloaded", timeout=35000)
                 page.wait_for_timeout(4000)
                 last_video_time = -1
 
-        # Her 30 dakikada bir Drops ilerlemesini tara ve takılma alarmını kontrol et
+        # Her 30 dakikada bir Drops taraması + Takılma alarmı
         if (time.time() - last_drops_scan) > 1800:
             last_drops_scan = time.time()
             scan_and_claim_drops(context, state)
@@ -652,35 +915,56 @@ def run_bot(context):
                 log("🚨 Süre üst üste 2 taramada ilerlemedi! Yayıncı değiştiriliyor...")
                 tg_send(
                     f"🚨 <b>SÜRE İLERLEMİYOR ALARMI!</b>\n"
-                    f"<code>{state['current_streamer']}</code> kanalında son 2 taramada SunsetK Badge ilerlemedi. Otomatik başka kanala geçiliyor...",
+                    f"<code>{state['current_streamer']}</code> kanalında son 2 taramada SunsetK Badge ilerlemedi. Başka kanala geçiliyor...",
                     critical=True,
                     state=state
                 )
                 state["stuck_scans"] = 0
                 save_state(state)
-                streamers = find_tr_gta6_streamers(page, state["blacklist"])
-                bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(streamers)
-                open_stream(page, streamers[bot_ctx["stream_idx"]], state)
+                detailed = fetch_tr_gta6_streamers_detailed(page, state["blacklist"])
+                bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(detailed)
+                open_stream(page, detailed[bot_ctx["stream_idx"]]["slug"], state, count_switch=True)
 
         time.sleep(4)
 
-    # Oturum süresi dolduysa ve durdurulmadıysa bayrağı devret
+    # Katman 1: Normal 5.4 saatlik bayrak devri
     if not bot_ctx["force_exit"] and not state.get("completed") and not state.get("paused"):
-        trigger_next_workflow(state)
+        trigger_next_workflow(state, reason="5.4 saatlik oturum tamamlandı")
 
 def main():
-    log("🚀 GTA VI 250 Saat Bulut Maraton Botu başlatılıyor...")
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir="/tmp/kick_chrome_profile",
-            channel="chrome",
-            headless=False,
-            viewport={"width": 1280, "height": 720},
-            locale="tr-TR",
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        run_bot(context)
-        context.close()
+    state = load_state()
+    if state.get("completed"):
+        log("🏆 250 saatlik ödül zaten alınmış, bot boşa çalışmadan kapanıyor.")
+        return
+
+    state["paused"] = False
+    state["session_count"] = state.get("session_count", 0) + 1
+    save_state(state)
+
+    log(f"🚀 GTA VI Bulut Maraton Botu başlatılıyor (Oturum #{state['session_count']})...")
+    crashed = False
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir="/tmp/kick_chrome_profile",
+                channel="chrome",
+                headless=False,
+                viewport={"width": 1280, "height": 720},
+                locale="tr-TR",
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            run_bot(context, state)
+            context.close()
+    except Exception as e:
+        crashed = True
+        err_short = str(e)[:300]
+        log(f"💥 BEKLENMEDİK ÇÖKME: {err_short}\n{traceback.format_exc()}")
+        tg_send(f"💥 <b>Bot Çöktü!</b> Otomatik kurtarma (Katman 2) devreye giriyor...\n<code>{err_short}</code>", critical=True, state=state)
+    finally:
+        # Katman 2: Beklenmedik çökmede ödül alınmadıysa ve durdurulmadıysa yeni sunucu başlat
+        state = load_state()
+        if crashed and not state.get("completed") and not state.get("paused"):
+            trigger_next_workflow(state, reason="Katman 2 otomatik çökme kurtarması")
 
 if __name__ == "__main__":
     main()
