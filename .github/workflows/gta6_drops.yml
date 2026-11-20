@@ -48,3 +48,27 @@ jobs:
       - name: GTA VI Drops Maraton Botunu Başlat
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python3 -u gta6_cloud_bot.py
+
+      - name: Katman 3 Kurtarma (Beklenmedik Çökme / Kapanma)
+        if: failure()
+        run: |
+          python3 -c '
+          import os, json, requests
+          state = {}
+          if os.path.exists("marathon_state.json"):
+              try:
+                  state = json.load(open("marathon_state.json", encoding="utf-8"))
+              except Exception:
+                  pass
+          if not state.get("completed") and not state.get("paused"):
+              repo = os.environ.get("GITHUB_REPOSITORY", "")
+              token = os.environ.get("GITHUB_TOKEN", "")
+              if repo and token:
+                  requests.post(
+                      f"https://api.github.com/repos/{repo}/actions/workflows/gta6_drops.yml/dispatches",
+                      headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+                      json={"ref": "main"},
+                      timeout=15
+                  )
+                  print("🔄 Katman 3 kurtarma tetiklendi.")
+          '
