@@ -127,16 +127,20 @@ def save_state(state):
 # ==========================================
 # 4. TELEGRAM API & UYGULAMA BENZERİ UI/UX
 # ==========================================
-def tg_api(method, data=None, files=None, timeout=15):
+def tg_api(method, data=None, files=None, timeout=25, retries=3):
     if not TELEGRAM_BOT_TOKEN:
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    try:
-        r = requests.post(url, data=data, files=files, timeout=timeout)
-        if r.ok:
-            return r.json()
-    except Exception as e:
-        log(f"[TG API HATA - {method}] {e}")
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(url, data=data, files=files, timeout=(10, timeout))
+            if r.ok:
+                return r.json()
+        except requests.exceptions.RequestException as e:
+            if attempt == retries:
+                log(f"[TG API HATA - {method}] {e}")
+            else:
+                time.sleep(2 * attempt)
     return None
 
 def setup_telegram_menu():
