@@ -9,6 +9,9 @@ import threading
 import warnings
 import traceback
 import requests
+import socket
+import urllib3.util.connection
+urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
@@ -133,7 +136,13 @@ def tg_api(method, data=None, files=None, timeout=25, retries=3):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     for attempt in range(1, retries + 1):
         try:
-            r = requests.post(url, data=data, files=files, timeout=(10, timeout))
+            r = requests.post(
+                url,
+                data=data,
+                files=files,
+                headers={"Connection": "close"},
+                timeout=(10, timeout)
+            )
             if r.ok:
                 return r.json()
         except requests.exceptions.RequestException as e:
