@@ -20,29 +20,31 @@ jobs:
   watch_gta6:
     runs-on: ubuntu-latest
     timeout-minutes: 350
-    strategy:
-      fail-fast: false
-      matrix:
-        worker_id: [1, 2, 3, 4, 5]
 
     steps:
-      - name: Checkout Repository
+      - name: Depoyu Çek (Checkout)
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Kalıcı Hafızayı Yükle (Cache)
+        uses: actions/cache@v4
+        with:
+          path: marathon_state.json
+          key: gta6-state-${{ github.run_id }}
+          restore-keys: |
+            gta6-state-
+
+      - name: Python 3.11 Kurulumu
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies & Patchright Chrome
+      - name: Bağımlılıklar ve Patchright Chrome Kurulumu
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb xauth libgbm-dev
           pip install patchright requests
           patchright install chrome
 
-      - name: Run Synchronized GTA 6 Worker (${{ matrix.worker_id }})
-        env:
-          WORKER_ID: ${{ matrix.worker_id }}
+      - name: GTA VI Drops Maraton Botunu Başlat
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python3 -u gta6_cloud_bot.py
