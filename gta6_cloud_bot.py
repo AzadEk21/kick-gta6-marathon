@@ -1023,19 +1023,28 @@ def check_stream_health(page, state, last_video_time):
         res = page.evaluate(f"""async () => {{
             const v = document.querySelector('video');
             let curTime = -1;
+            let readyState = 4;
             if (v) {{
                 if (v.paused) v.play().catch(() => {{}});
                 curTime = v.currentTime;
+                readyState = v.readyState;
             }}
+            const bodyTxt = (document.body ? document.body.innerText : '').toLowerCase();
+            const isDisconnected = (
+                bodyTxt.includes('bağlantı kesildi') ||
+                bodyTxt.includes('şimdi yeniden dene') ||
+                bodyTxt.includes('connection lost') ||
+                bodyTxt.includes('try again now')
+            );
             try {{
                 const r = await fetch('https://kick.com/api/v2/channels/{slug}');
-                if (!r.ok) return {{ ok: true, curTime: curTime, isGta6: true }};
+                if (!r.ok) return {{ ok: true, curTime: curTime, readyState: readyState, isDisconnected: isDisconnected, isGta6: true }};
                 const d = await r.json();
                 const isLive = Boolean(d && d.livestream && d.livestream.is_live);
                 const cats = (d && d.livestream && d.livestream.categories) ? d.livestream.categories : [];
                 const isGta6 = cats.some(c => (c.slug || '').includes('grand-theft-auto-vi') || (c.name || '').toLowerCase().includes('grand theft auto vi'));
-                return {{ ok: isLive, curTime: curTime, isGta6: isGta6, viewers: d?.livestream?.viewer_count || 0, title: d?.livestream?.session_title || '' }};
-            }} catch(e) {{ return {{ ok: true, curTime: curTime, isGta6: true }}; }}
+                return {{ ok: isLive, curTime: curTime, readyState: readyState, isDisconnected: isDisconnected, isGta6: isGta6, viewers: d?.livestream?.viewer_count || 0, title: d?.livestream?.session_title || '' }};
+            }} catch(e) {{ return {{ ok: true, curTime: curTime, readyState: readyState, isDisconnected: isDisconnected, isGta6: true }}; }}
         }}""")
 
         if res.get("viewers"):
@@ -1049,11 +1058,83 @@ def check_stream_health(page, state, last_video_time):
             return "offline", cur_time
         if not res.get("isGta6", True):
             return "wrong_game", cur_time
+        if res.get("isDisconnected") or res.get("readyState", 4) < 2:
+            return "disconnected", cur_time
         if last_video_time > 0 and cur_time == last_video_time:
             return "frozen", cur_time
         return "healthy", cur_time
     except Exception:
         return "healthy", last_video_time
+
+def recover_stream_player(page, state):
+    """
+    Aşama 1: 'Şimdi yeniden dene' butonuna tıklar.
+    Aşama 2: Düzelmezse F5 atıp 160p + sohbet gizlemeyi tekrar uygular.
+    Düzelirse True, hala kopuksa False (kanal değiştir) döner.
+    """
+    def _is_playing():
+        try:
+            t1 = page.evaluate("() => { const v = document.querySelector('video'); return v ? v.currentTime : -1; }")
+            page.wait_for_timeout(3000)
+            t2 = page.evaluate("() => { const v = document.querySelector('video'); return v ? v.currentTime : -1; }")
+            return t2 > t1 and t2 > 0
+        except Exception:
+            return False
+
+    # Aşama 1: Ekrandaki 'Şimdi yeniden dene' butonuna tıkla
+    try:
+        clicked = page.evaluate(r"""() => {
+            const keys = ['şimdi yeniden dene', 'try again', 'yeniden dene', 'reconnect'];
+            for (const b of document.querySelectorAll('button')) {
+                const t = (b.innerText || '').trim().toLowerCase();
+                if (keys.some(k => t.includes(k))) { b.click(); return true; }
+            }
+            return false;
+        }""")
+        if clicked:
+            log("🔄 'Şimdi yeniden dene' butonuna tıklandı, akış kontrol ediliyor...")
+            page.wait_for_timeout(4000)
+            if _is_playing():
+                log("✅ Aşama 1 başarılı: Yayın kaldığı yerden devam ediyor.")
+                return True
+    except Exception:
+        pass
+
+    # Aşama 2: F5 (Reload) + 160p + Sohbet Kapatma
+    try:
+        log("🔄 Aşama 2: Sayfa yenileniyor (F5)...")
+        page.reload(wait_until="domcontentloaded", timeout=35000)
+        bypass_cloudflare(page)
+        page.wait_for_timeout(4000)
+        page.evaluate(r"""() => {
+            const v = document.querySelector('video');
+            if (v) { v.muted = true; v.play().catch(() => {}); }
+            ['#channel-chatroom', '[data-testid="chatroom"]', 'aside'].forEach(sel => {
+                document.querySelectorAll(sel).forEach(el => {
+                    if ((el.innerText || '').toLowerCase().includes('sohbet') || (el.innerText || '').toLowerCase().includes('chat') || sel.includes('chat')) {
+                        el.style.display = 'none'; el.innerHTML = '';
+                    }
+                });
+            });
+        }""")
+        try:
+            settings_btn = page.locator('button[aria-label*="Settings"], button[aria-label*="Ayarlar"]').first
+            if settings_btn.is_visible(timeout=2000):
+                settings_btn.click()
+                page.wait_for_timeout(500)
+                q_btn = page.locator('text=/160p/i').first
+                if q_btn.is_visible(timeout=1500):
+                    q_btn.click()
+        except Exception:
+            pass
+
+        if _is_playing():
+            log("✅ Aşama 2 başarılı: F5 sonrası yayın akıyor.")
+            return True
+    except Exception:
+        pass
+
+    return False
 
 # ==========================================
 # 10. GÜNLÜK RAPOR & BAYRAK DEVRİ
@@ -1379,6 +1460,7 @@ def run_bot(context, state):
         last_drops = time.time()
         last_lock_check = time.time()
         last_video_time = -1
+        disconnect_times = []  # Son 15 dakikadaki kopma zamanları
 
         while (time.time() - bot_ctx["start_time"]) < MAX_RUN_SECONDS:
             if bot_ctx["force_exit"] or state.get("completed"):
@@ -1396,8 +1478,8 @@ def run_bot(context, state):
                     bot_ctx["force_exit"] = True
                     break
 
-            # Her 3 dakikada bir yayın sağlığı, kategori ve donma kontrolü
-            if (time.time() - last_health) > 180:
+            # Her 60 saniyede bir yayın sağlığı, kopma ve donma kontrolü
+            if (time.time() - last_health) > 60:
                 last_health = time.time()
                 status, last_video_time = check_stream_health(page, state, last_video_time)
 
@@ -1412,21 +1494,45 @@ def run_bot(context, state):
                     bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(streamers)
                     new_ch = streamers[bot_ctx["stream_idx"]]["slug"]
                     open_stream(page, new_ch, state, count_switch=True)
+                    disconnect_times.clear()
 
                     if state.get("notify_switch", True):
                         send_temp_message(f"🔄 <b>Kanal Değişti:</b> <code>{old_ch}</code> ({reason}) ➡️ <code>{new_ch}</code>", critical=False, state=state)
                     render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"]), get_main_panel_kb(state))
                     last_video_time = -1
 
-                elif status == "frozen":
-                    log(f"❄️ {state['current_streamer']} dondu, sayfa yenileniyor...")
+                elif status in ("disconnected", "frozen"):
+                    now_ts = time.time()
+                    disconnect_times = [t for t in disconnect_times if (now_ts - t) <= 900]
+                    disconnect_times.append(now_ts)
+
+                    reason_tr = "Bağlantı kesildi" if status == "disconnected" else "Oynatıcı dondu"
+                    log(f"❄️ {state['current_streamer']} - {reason_tr} (Son 15 dk: {len(disconnect_times)}. kez)")
                     state["health_status"] = "🟡 Yenileniyor"
-                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"], banner="Oynatıcı dondu, sayfa yenileniyor..."), get_main_panel_kb(state))
-                    page.reload(wait_until="domcontentloaded", timeout=35000)
-                    page.wait_for_timeout(4000)
-                    state["health_status"] = "🟢 Canlı"
-                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"]), get_main_panel_kb(state))
-                    last_video_time = -1
+                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"], banner=f"{reason_tr}, kurtarılıyor..."), get_main_panel_kb(state))
+
+                    # 15 dk içinde 2. kopmaysa veya Aşama 1+2 başarısız olursa başka GTA VI kanalına geç
+                    recovered = False
+                    if len(disconnect_times) < 2:
+                        recovered = recover_stream_player(page, state)
+
+                    if recovered:
+                        state["health_status"] = "🟢 Canlı"
+                        render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"]), get_main_panel_kb(state))
+                        last_video_time = -1
+                    else:
+                        old_ch = state["current_streamer"]
+                        log(f"🚨 Aşama 3: {old_ch} kurtarılamadı / sık kopuyor, yeni GTA VI yayınına geçiliyor...")
+                        streamers = fetch_gta6_streamers_strict(context, state)
+                        bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(streamers)
+                        new_ch = streamers[bot_ctx["stream_idx"]]["slug"]
+                        open_stream(page, new_ch, state, count_switch=True)
+                        disconnect_times.clear()
+
+                        if state.get("notify_switch", True):
+                            send_temp_message(f"🔄 <b>Otomatik Kanal Değişimi:</b> <code>{old_ch}</code> ({reason_tr}) ➡️ <code>{new_ch}</code>", critical=False, state=state)
+                        render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"]), get_main_panel_kb(state))
+                        last_video_time = -1
 
             # Her 15 dakikada bir Drops taraması + Sabit Pano Güncelleme
             if (time.time() - last_drops) > 900:
