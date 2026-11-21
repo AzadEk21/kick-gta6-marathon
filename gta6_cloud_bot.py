@@ -88,6 +88,67 @@ VISIBILITY_JS = r"""
     Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
     document.hasFocus = () => true;
     window.addEventListener('blur', (e) => e.stopImmediatePropagation(), true);
+
+    // WebSocket Kancası (Hayalet İzleme / Heartbeat Motoru)
+    const activeSockets = new Set();
+    let watchPayload = null;
+    let handshakePayload = null;
+    let pingCount = 0;
+
+    const OrigWebSocket = window.WebSocket;
+    const origWSSend = OrigWebSocket.prototype.send;
+
+    window.WebSocket = function(...args) {
+        const ws = new OrigWebSocket(...args);
+        activeSockets.add(ws);
+        return ws;
+    };
+    window.WebSocket.prototype = OrigWebSocket.prototype;
+    window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+    window.WebSocket.OPEN = OrigWebSocket.OPEN;
+    window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+    window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
+
+    OrigWebSocket.prototype.send = function(data) {
+        activeSockets.add(this);
+        if (typeof data === 'string') {
+            if (data.includes('tracking.user.watch.livestream')) watchPayload = data;
+            if (data.includes('channel_handshake')) handshakePayload = data;
+        }
+        return origWSSend.apply(this, arguments);
+    };
+
+    window.__INIT_WATCH_PAYLOAD__ = function(cid, lid, vid) {
+        if (!watchPayload && cid && lid) {
+            watchPayload = JSON.stringify({
+                type: "user_event",
+                data: { message: { name: "tracking.user.watch.livestream", channel_id: cid, livestream_id: lid, vod_id: vid || crypto.randomUUID() } }
+            });
+        }
+        if (!handshakePayload && cid) {
+            handshakePayload = JSON.stringify({
+                type: "channel_handshake",
+                data: { message: { channelId: String(cid) } }
+            });
+        }
+    };
+
+    window.__SEND_WS_HEARTBEAT__ = function() {
+        activeSockets.forEach(ws => { if (ws.readyState !== 1) activeSockets.delete(ws); });
+        let sent = false;
+        activeSockets.forEach(ws => {
+            if (ws.readyState === 1) {
+                try {
+                    origWSSend.call(ws, JSON.stringify({ type: "ping" }));
+                    if (handshakePayload) origWSSend.call(ws, handshakePayload);
+                    if (watchPayload) origWSSend.call(ws, watchPayload);
+                    sent = true;
+                } catch (e) {}
+            }
+        });
+        if (sent) pingCount++;
+        return { wsCount: activeSockets.size, pingCount: pingCount, hasPayload: Boolean(watchPayload) };
+    };
 })();
 """
 
@@ -667,15 +728,19 @@ def setup_resource_blocker(context):
     def route_handler(route):
         url = route.request.url.lower()
         res_type = route.request.resource_type
+        # Ağır video parçalarını engelle (Hayalet izleme için sadece WebSocket + API yeterli)
+        if ".ts" in url or ".m4s" in url or "live-video.net" in url:
+            route.abort()
+            return
         if (
-            "challenges.cloudflare.com" in url or "live-video.net" in url
-            or ".m3u8" in url or ".ts" in url or "kick.com/api/" in url
+            "challenges.cloudflare.com" in url or "kick.com/api/" in url
             or "websockets.kick.com" in url
         ):
             route.continue_()
             return
-        if any(d in url for d in blocked_domains) or res_type in ("font", "image"):
+        if any(d in url for d in blocked_domains) or res_type in ("font", "image", "media"):
             route.abort()
+            return
             return
         route.continue_()
     context.route("**/*", route_handler)
@@ -1009,9 +1074,23 @@ def open_stream(page, slug, state, count_switch=False):
     except Exception:
         pass
 
+    # API'den channel_id ve livestream_id çekip WebSocket hayalet izleme payload'ını kilitle
+    page.evaluate(f"""async () => {{
+        try {{
+            const r = await fetch('https://kick.com/api/v2/channels/{slug}');
+            if (!r.ok) return;
+            const d = await r.json();
+            if (d && d.livestream) {{
+                const vid = d.livestream.video?.uuid || d.recent_streams?.[0]?.video?.uuid || '';
+                if (window.__INIT_WATCH_PAYLOAD__) window.__INIT_WATCH_PAYLOAD__(d.id, d.livestream.id, vid);
+                if (window.__SEND_WS_HEARTBEAT__) window.__SEND_WS_HEARTBEAT__();
+            }}
+        }} catch(e) {{}}
+    }}""")
+
     meta = fetch_single_channel_info(page, slug)
     state["current_streamer"] = slug
-    state["health_status"] = "🟢 Canlı"
+    state["health_status"] = "🟢 Hayalet İzleme"
     if meta and meta.get("is_live"):
         state["current_viewers"] = meta.get("viewers", 0)
         state["current_title"] = meta.get("title", "GTA VI")
@@ -1058,10 +1137,10 @@ def check_stream_health(page, state, last_video_time):
             return "offline", cur_time
         if not res.get("isGta6", True):
             return "wrong_game", cur_time
-        if res.get("isDisconnected") or res.get("readyState", 4) < 2:
+        # Hayalet modda video yerine WebSocket sağlığını kontrol et
+        ws_ok = page.evaluate("() => window.__SEND_WS_HEARTBEAT__ ? window.__SEND_WS_HEARTBEAT__().wsCount > 0 : true")
+        if not ws_ok:
             return "disconnected", cur_time
-        if last_video_time > 0 and cur_time == last_video_time:
-            return "frozen", cur_time
         return "healthy", cur_time
     except Exception:
         return "healthy", last_video_time
@@ -1459,8 +1538,10 @@ def run_bot(context, state):
         last_health = time.time()
         last_drops = time.time()
         last_lock_check = time.time()
+        last_heartbeat = time.time()
+        next_hb_delay = random.uniform(27.0, 33.0)
         last_video_time = -1
-        disconnect_times = []  # Son 15 dakikadaki kopma zamanları
+        disconnect_times = []
 
         while (time.time() - bot_ctx["start_time"]) < MAX_RUN_SECONDS:
             if bot_ctx["force_exit"] or state.get("completed"):
@@ -1469,6 +1550,17 @@ def run_bot(context, state):
             process_queued_commands(page, context, bot_ctx)
             cleanup_expired_temp_messages(state)
             check_daily_report(state)
+
+            # Hayalet İzleme: Her ~30 saniyede bir WebSocket Sinyali (Heartbeat)
+            if (time.time() - last_heartbeat) >= next_hb_delay:
+                last_heartbeat = time.time()
+                next_hb_delay = random.uniform(27.0, 33.0)
+                try:
+                    hb = page.evaluate("() => window.__SEND_WS_HEARTBEAT__ ? window.__SEND_WS_HEARTBEAT__() : null")
+                    if hb and hb.get("pingCount", 0) % 5 == 0:
+                        log(f"⚡ Hayalet Sinyal #{hb['pingCount']} | WS: {hb['wsCount']} | Payload: {'🟢' if hb['hasPayload'] else '🟡'}")
+                except Exception:
+                    pass
 
             # Çift Sunucu Çakışma Kilidi (Her 30 sn)
             if (time.time() - last_lock_check) > 30:
