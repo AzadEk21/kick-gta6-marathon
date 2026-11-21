@@ -80,7 +80,7 @@ def format_viewers(count):
         return "?"
 
 # ==========================================
-# 2. GÖRÜNÜRLÜK KORUMA SCRIPTI
+# 2. GÖRÜNÜRLÜK KORUMA & WEBSOCKET KANCASI
 # ==========================================
 VISIBILITY_JS = r"""
 (() => {
@@ -89,7 +89,7 @@ VISIBILITY_JS = r"""
     document.hasFocus = () => true;
     window.addEventListener('blur', (e) => e.stopImmediatePropagation(), true);
 
-    // WebSocket Kancası (Hayalet İzleme / Heartbeat Motoru)
+    // WebSocket Kancası (Heartbeat Motoru)
     const activeSockets = new Set();
     let watchPayload = null;
     let handshakePayload = null;
@@ -253,7 +253,7 @@ def setup_telegram_menu():
     commands = [
         {"command": "durum", "description": "🏠 Canlı kontrol panelini aç"},
         {"command": "yayincilar", "description": "📺 Canlı GTA VI yayıncılarını listele"},
-        {"command": "ekran", "description": "📸 Kırpılmış canlı yayın ekranı"},
+        {"command": "ekran", "description": "📸 Anlık canlı yayın ekranı"},
         {"command": "drops", "description": "🎁 SunsetK Badge ilerlemesini tara"},
         {"command": "ayarlar", "description": "⚙️ Bildirimler, kara liste ve sistem"},
         {"command": "log", "description": "📜 Son 25 çalışma kaydı"}
@@ -314,7 +314,6 @@ def calc_hourly_gain_min(state):
         return None
     now_ts = time.time()
     cur_ratio = state.get("progress_ratio", 0.0)
-    # Son 65 dakika içindeki en eski kaydı bul
     oldest = None
     for ts, r in hist:
         if (now_ts - ts) <= 3900:
@@ -335,7 +334,6 @@ def get_main_panel_text(state, start_time, session_start_ratio=0.0, banner=""):
     eta_dt = now_tr() + timedelta(minutes=rem_min)
     eta_str = eta_dt.strftime("%d.%m.%Y %H:%M") if pct > 0 else "Hesaplanıyor..."
 
-    # Oturumluk ve saatlik ilerleme kıyası
     sess_gain = 0
     if session_start_ratio > 0 and state.get("progress_ratio", 0.0) >= session_start_ratio:
         sess_gain = int(round((state["progress_ratio"] - session_start_ratio) * TOTAL_TARGET_MINUTES))
@@ -563,29 +561,41 @@ def send_temp_message(text, critical=False, state=None, auto_clean=True):
         return mid
     return None
 
-def route_handler(route):
-        url = route.request.url.lower()
-        res_type = route.request.resource_type
-        if (
-            "challenges.cloudflare.com" in url or "live-video.net" in url
-            or ".m3u8" in url or ".ts" in url or ".m4s" in url
-            or "kick.com/api/" in url or "websockets.kick.com" in url
-        ):
-            route.continue_()
-            return
-        if any(d in url for d in blocked_domains) or res_type in ("font", "image"):
-            route.abort()
-            return
-        route.continue_()
+def send_cropped_screenshot(page, caption, critical=False, state=None):
+    """Hatasız ve hızlı viewport ekran görüntüsü + WebSocket sinyal bilgisi + 10 dk otomatik temizlik."""
+    if not TELEGRAM_CHAT_ID:
+        return
+    path = "live_screen.png"
+    try:
+        ws_info = ""
+        try:
+            hb = page.evaluate("() => window.__SEND_WS_HEARTBEAT__ ? window.__SEND_WS_HEARTBEAT__() : null")
+            if hb:
+                ws_info = f"\n⚡ <b>WS Sinyal:</b> #{hb.get('pingCount', 0)} (Bağlantı: {hb.get('wsCount', 0)})"
+        except Exception:
+            pass
+
+        page.screenshot(path=path, full_page=False, timeout=15000)
+
+        silent = "true" if (not critical and is_dnd_hours()) else "false"
+        final_caption = sanitize_text(f"{caption}{ws_info}")[:1000]
+        with open(path, "rb") as photo:
+            res = tg_api("sendPhoto", data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "caption": final_caption,
+                "parse_mode": "HTML",
+                "disable_notification": silent,
+                "reply_markup": json.dumps({"inline_keyboard": [[{"text": "🗑️ Bu Mesajı Sil", "callback_data": "act:del_msg"}]]})
+            }, files={"photo": photo}, timeout=25)
+            if res and res.get("ok") and not critical:
+                register_temp_message(res["result"]["message_id"], state)
+    except Exception as e:
+        log(f"⚠️ Ekran görüntüsü hatası: {e}")
 
 # ==========================================
 # 5. ARKA PLAN TELEGRAM DİNLEYİCİSİ (WHITELIST + COOLDOWN)
 # ==========================================
 def telegram_listener_thread(state_ref, stop_event):
-    """
-    Sıkı chat_id + from.id beyaz listesi (Hayalet Mod) ve
-    kuyruk taşma/spam koruması (Cooldown) ile arka planda dinler.
-    """
     offset = state_ref.get("last_update_offset", 0)
     last_action_ts = {}
     heavy_actions = {"act:next", "act:prev", "act:drops", "act:refresh_list", "act:toggle_lang", "act:screen"}
@@ -613,7 +623,6 @@ def telegram_listener_thread(state_ref, stop_event):
                     from_id = str(cb.get("from", {}).get("id", ""))
                     chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
 
-                    # Sıkı Beyaz Liste (Hayalet Mod)
                     if TELEGRAM_CHAT_ID and (from_id != str(TELEGRAM_CHAT_ID) or chat_id != str(TELEGRAM_CHAT_ID)):
                         continue
 
@@ -629,7 +638,6 @@ def telegram_listener_thread(state_ref, stop_event):
                         delete_message(msg_id)
                         continue
 
-                    # Spam / Cooldown Koruması (Ağır işlemlerde 3 sn bekleme)
                     now_ts = time.time()
                     if data in heavy_actions and (now_ts - last_action_ts.get(data, 0)) < 3.0:
                         answer_toast(cb_id, "⏳ Bu işlem zaten sıraya alındı, lütfen bekle...")
@@ -657,7 +665,6 @@ def telegram_listener_thread(state_ref, stop_event):
                     from_id = str(msg.get("from", {}).get("id", ""))
                     chat_id = str(msg.get("chat", {}).get("id", ""))
 
-                    # Sıkı Beyaz Liste (Hayalet Mod)
                     if TELEGRAM_CHAT_ID and (from_id != str(TELEGRAM_CHAT_ID) or chat_id != str(TELEGRAM_CHAT_ID)):
                         continue
 
@@ -716,24 +723,20 @@ def setup_resource_blocker(context):
     def route_handler(route):
         url = route.request.url.lower()
         res_type = route.request.resource_type
-        # Ağır video parçalarını engelle (Hayalet izleme için sadece WebSocket + API yeterli)
-        if ".ts" in url or ".m4s" in url or "live-video.net" in url:
-            route.abort()
-            return
         if (
-            "challenges.cloudflare.com" in url or "kick.com/api/" in url
-            or "websockets.kick.com" in url
+            "challenges.cloudflare.com" in url or "live-video.net" in url
+            or ".m3u8" in url or ".ts" in url or ".m4s" in url
+            or "kick.com/api/" in url or "websockets.kick.com" in url
         ):
             route.continue_()
             return
-        if any(d in url for d in blocked_domains) or res_type in ("font", "image", "media"):
+        if any(d in url for d in blocked_domains) or res_type in ("font", "image"):
             route.abort()
             return
         route.continue_()
     context.route("**/*", route_handler)
 
 def parse_and_load_cookies(context, state):
-    """Çerezleri yükler ve oturum çerezlerinin son kullanma tarihini (24 sa uyarısı) kontrol eder."""
     if not KICK_COOKIES_RAW:
         log("❌ KICK_COOKIES_JSON secret bulunamadı!")
         return False
@@ -755,7 +758,6 @@ def parse_and_load_cookies(context, state):
                 if "kick.com" not in domain:
                     continue
 
-                # Çerez geçerlilik süresi (expirationDate) kontrolü
                 exp = c.get("expirationDate")
                 if exp and any(k in str(name).lower() for k in ("session", "token", "auth", "kick")):
                     rem_sec = float(exp) - now_ts
@@ -804,7 +806,6 @@ def check_session_authenticated(page):
 # 7. SADECE GERÇEK GTA VI YAYINCILARINI ÇEKME & TEKİL DOĞRULAMA
 # ==========================================
 def fetch_single_channel_info(page, slug):
-    """Tek bir kanalın canlılık, GTA VI kategorisi, başlık, izleyici ve drops bilgisini çeker."""
     try:
         return page.evaluate(f"""async () => {{
             try {{
@@ -956,12 +957,10 @@ def scan_and_claim_drops(context, state):
             if state.get("daily_start_ratio", 0.0) == 0.0:
                 state["daily_start_ratio"] = ratio
 
-            # Saatlik geçmişi güncelle (son 2 saati tut)
             hist = state.get("hourly_history", [])
             hist.append([now_ts, ratio])
             state["hourly_history"] = [x for x in hist if (now_ts - x[0]) <= 7200][-20:]
 
-            # Verimlilik hesabı (en az 3 dakika geçmişse)
             if last_ts > 0 and (now_ts - last_ts) >= 180:
                 real_min = (now_ts - last_ts) / 60.0
                 gained_min = max(0.0, (ratio - last_ratio) * TOTAL_TARGET_MINUTES)
@@ -986,7 +985,6 @@ def scan_and_claim_drops(context, state):
             state["last_scan_ratio"] = ratio
             state["remaining_text"] = f"{rem_min // 60} sa. {rem_min % 60} dk. kaldı (İzlenen: {watched_min // 60} sa. {watched_min % 60} dk.)"
 
-            # %5 İlerleme Kilometre Taşı Bildirimi
             current_milestone = int(pct // 5) * 5
             if current_milestone >= 5 and current_milestone > state.get("last_milestone", 0):
                 state["last_milestone"] = current_milestone
@@ -1012,8 +1010,28 @@ def scan_and_claim_drops(context, state):
     return summary
 
 # ==========================================
-# 9. YAYIN AÇICI, 160P & SOHBET KAPATICI
+# 9. YAYIN AÇICI, KARARLI 160P & SOHBET KAPATICI
 # ==========================================
+def set_player_160p(page):
+    """Oynatıcı üzerine gelip ayarlar menüsünden kaliteyi 160p'ye düşürür."""
+    try:
+        page.mouse.move(640, 360)
+        page.wait_for_timeout(400)
+        settings_btn = page.locator('button[aria-label*="Settings"], button[aria-label*="Ayarlar"], button[data-testid="settings-button"]').first
+        if settings_btn.is_visible(timeout=2500):
+            settings_btn.click()
+            page.wait_for_timeout(500)
+            q_menu = page.locator('text=/Quality|Kalite/i').first
+            if q_menu.is_visible(timeout=1000):
+                q_menu.click()
+                page.wait_for_timeout(400)
+            q_btn = page.locator('text=/160p/i').first
+            if q_btn.is_visible(timeout=1500):
+                q_btn.click()
+                log("📉 Yayın kalitesi 160p olarak ayarlandı.")
+    except Exception:
+        pass
+
 def open_stream(page, slug, state, count_switch=False):
     old_slug = state.get("current_streamer", "")
     if old_slug and old_slug != "Yok" and old_slug != slug:
@@ -1050,18 +1068,9 @@ def open_stream(page, slug, state, count_switch=False):
         });
     }""")
 
-    try:
-        settings_btn = page.locator('button[aria-label*="Settings"], button[aria-label*="Ayarlar"]').first
-        if settings_btn.is_visible(timeout=2000):
-            settings_btn.click()
-            page.wait_for_timeout(500)
-            q_btn = page.locator('text=/160p/i').first
-            if q_btn.is_visible(timeout=1500):
-                q_btn.click()
-    except Exception:
-        pass
+    set_player_160p(page)
 
-    # API'den channel_id ve livestream_id çekip WebSocket hayalet izleme payload'ını kilitle
+    # API'den channel_id ve livestream_id çekip WebSocket heartbeat payload'ını kilitle
     page.evaluate(f"""async () => {{
         try {{
             const r = await fetch('https://kick.com/api/v2/channels/{slug}');
@@ -1077,7 +1086,7 @@ def open_stream(page, slug, state, count_switch=False):
 
     meta = fetch_single_channel_info(page, slug)
     state["current_streamer"] = slug
-    state["health_status"] = "🟢 Hayalet İzleme"
+    state["health_status"] = "🟢 Canlı"
     if meta and meta.get("is_live"):
         state["current_viewers"] = meta.get("viewers", 0)
         state["current_title"] = meta.get("title", "GTA VI")
@@ -1124,20 +1133,16 @@ def check_stream_health(page, state, last_video_time):
             return "offline", cur_time
         if not res.get("isGta6", True):
             return "wrong_game", cur_time
-        # Hayalet modda video yerine WebSocket sağlığını kontrol et
-        ws_ok = page.evaluate("() => window.__SEND_WS_HEARTBEAT__ ? window.__SEND_WS_HEARTBEAT__().wsCount > 0 : true")
-        if not ws_ok:
+        if res.get("isDisconnected") or res.get("readyState", 4) < 2:
             return "disconnected", cur_time
+        if last_video_time > 0 and cur_time == last_video_time:
+            return "frozen", cur_time
         return "healthy", cur_time
     except Exception:
         return "healthy", last_video_time
 
 def recover_stream_player(page, state):
-    """
-    Aşama 1: 'Şimdi yeniden dene' butonuna tıklar.
-    Aşama 2: Düzelmezse F5 atıp 160p + sohbet gizlemeyi tekrar uygular.
-    Düzelirse True, hala kopuksa False (kanal değiştir) döner.
-    """
+    """Aşama 1: 'Şimdi yeniden dene' tıklar. Aşama 2: F5 + 160p + sohbet gizleme uygular."""
     def _is_playing():
         try:
             t1 = page.evaluate("() => { const v = document.querySelector('video'); return v ? v.currentTime : -1; }")
@@ -1147,7 +1152,6 @@ def recover_stream_player(page, state):
         except Exception:
             return False
 
-    # Aşama 1: Ekrandaki 'Şimdi yeniden dene' butonuna tıkla
     try:
         clicked = page.evaluate(r"""() => {
             const keys = ['şimdi yeniden dene', 'try again', 'yeniden dene', 'reconnect'];
@@ -1166,7 +1170,6 @@ def recover_stream_player(page, state):
     except Exception:
         pass
 
-    # Aşama 2: F5 (Reload) + 160p + Sohbet Kapatma
     try:
         log("🔄 Aşama 2: Sayfa yenileniyor (F5)...")
         page.reload(wait_until="domcontentloaded", timeout=35000)
@@ -1183,16 +1186,7 @@ def recover_stream_player(page, state):
                 });
             });
         }""")
-        try:
-            settings_btn = page.locator('button[aria-label*="Settings"], button[aria-label*="Ayarlar"]').first
-            if settings_btn.is_visible(timeout=2000):
-                settings_btn.click()
-                page.wait_for_timeout(500)
-                q_btn = page.locator('text=/160p/i').first
-                if q_btn.is_visible(timeout=1500):
-                    q_btn.click()
-        except Exception:
-            pass
+        set_player_160p(page)
 
         if _is_playing():
             log("✅ Aşama 2 başarılı: F5 sonrası yayın akıyor.")
@@ -1249,7 +1243,6 @@ def process_queued_commands(page, context, bot_ctx):
     state = bot_ctx["state"]
     sess_ratio = bot_ctx["session_start_ratio"]
 
-    # Kuyruktaki tüm bekleyen komutları çek ve aynı ağır komutları birleştir (deduplication)
     pending = []
     seen_heavy = set()
     while not CMD_QUEUE.empty():
@@ -1267,7 +1260,6 @@ def process_queued_commands(page, context, bot_ctx):
             reply_to = extra or ""
             cmd = txt.lower()
 
-            # ForceReply ile gelen kanal arama cevabı
             if bot_ctx.get("awaiting_channel_reply") or "kanal adını yaz" in reply_to.lower():
                 bot_ctx["awaiting_channel_reply"] = False
                 if not cmd.startswith("/"):
@@ -1309,7 +1301,6 @@ def process_queued_commands(page, context, bot_ctx):
                     render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), critical=True)
             continue
 
-        # Callback (Buton) İşlemleri
         data = payload
         msg_id = extra
 
@@ -1323,7 +1314,6 @@ def process_queued_commands(page, context, bot_ctx):
             render_panel(state, f"📺 <b>CANLI GTA VI YAYINCILARI ({lang_label})</b>\n<i>Detay görmek ve izlemek için kanala dokun:</i>", get_channels_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data.startswith("info:"):
-            # Akıllı Yayıncı Kartı & Seçim Detayı
             slug = data.split(":", 1)[1]
             item = next((x for x in state.get("cached_streamers", []) if x["slug"] == slug), None)
             if not item:
@@ -1538,14 +1528,14 @@ def run_bot(context, state):
             cleanup_expired_temp_messages(state)
             check_daily_report(state)
 
-            # Hayalet İzleme: Her ~30 saniyede bir WebSocket Sinyali (Heartbeat)
+            # Her ~30 saniyede bir WebSocket Sinyali (Heartbeat)
             if (time.time() - last_heartbeat) >= next_hb_delay:
                 last_heartbeat = time.time()
                 next_hb_delay = random.uniform(27.0, 33.0)
                 try:
                     hb = page.evaluate("() => window.__SEND_WS_HEARTBEAT__ ? window.__SEND_WS_HEARTBEAT__() : null")
                     if hb and hb.get("pingCount", 0) % 5 == 0:
-                        log(f"⚡ Hayalet Sinyal #{hb['pingCount']} | WS: {hb['wsCount']} | Payload: {'🟢' if hb['hasPayload'] else '🟡'}")
+                        log(f"⚡ WS Sinyal #{hb['pingCount']} | Bağlantı: {hb['wsCount']} | Payload: {'🟢' if hb['hasPayload'] else '🟡'}")
                 except Exception:
                     pass
 
@@ -1590,7 +1580,6 @@ def run_bot(context, state):
                     state["health_status"] = "🟡 Yenileniyor"
                     render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"], banner=f"{reason_tr}, kurtarılıyor..."), get_main_panel_kb(state))
 
-                    # 15 dk içinde 2. kopmaysa veya Aşama 1+2 başarısız olursa başka GTA VI kanalına geç
                     recovered = False
                     if len(disconnect_times) < 2:
                         recovered = recover_stream_player(page, state)
