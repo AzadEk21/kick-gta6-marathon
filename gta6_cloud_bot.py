@@ -563,32 +563,20 @@ def send_temp_message(text, critical=False, state=None, auto_clean=True):
         return mid
     return None
 
-def send_cropped_screenshot(page, caption, critical=False, state=None):
-    """Mobil uyumlu kırpılmış video oynatıcı ekran görüntüsü + 10 dk otomatik temizlik."""
-    if not TELEGRAM_CHAT_ID:
-        return
-    path = "live_screen.png"
-    try:
-        video_el = page.locator("video").first
-        box = video_el.bounding_box() if video_el.count() > 0 else None
-        if box and box["width"] > 200 and box["height"] > 120:
-            page.screenshot(path=path, clip=box)
-        else:
-            page.screenshot(path=path, full_page=False)
-
-        silent = "true" if (not critical and is_dnd_hours()) else "false"
-        with open(path, "rb") as photo:
-            res = tg_api("sendPhoto", data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "caption": sanitize_text(caption)[:1000],
-                "parse_mode": "HTML",
-                "disable_notification": silent,
-                "reply_markup": json.dumps({"inline_keyboard": [[{"text": "🗑️ Bu Mesajı Sil", "callback_data": "act:del_msg"}]]})
-            }, files={"photo": photo}, timeout=25)
-            if res and res.get("ok") and not critical:
-                register_temp_message(res["result"]["message_id"], state)
-    except Exception as e:
-        log(f"⚠️ Ekran görüntüsü hatası: {e}")
+def route_handler(route):
+        url = route.request.url.lower()
+        res_type = route.request.resource_type
+        if (
+            "challenges.cloudflare.com" in url or "live-video.net" in url
+            or ".m3u8" in url or ".ts" in url or ".m4s" in url
+            or "kick.com/api/" in url or "websockets.kick.com" in url
+        ):
+            route.continue_()
+            return
+        if any(d in url for d in blocked_domains) or res_type in ("font", "image"):
+            route.abort()
+            return
+        route.continue_()
 
 # ==========================================
 # 5. ARKA PLAN TELEGRAM DİNLEYİCİSİ (WHITELIST + COOLDOWN)
