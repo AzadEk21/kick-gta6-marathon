@@ -238,7 +238,7 @@ def tg_api(method, data=None, files=None, timeout=15, retries=2):
             )
             if r.ok:
                 return r.json()
-            if r.status_code == 400 and "message is not modified" in r.text.lower():
+            if r.status_code == 400 and ("message is not modified" in r.text.lower() or "message to delete not found" in r.text.lower()):
                 return {"ok": True}
             log(f"[TG API RED - {method}] HTTP {r.status_code}: {sanitize_text(r.text[:150])}")
             return None
@@ -723,6 +723,40 @@ def setup_resource_blocker(context):
     def route_handler(route):
         url = route.request.url.lower()
         res_type = route.request.resource_type
+
+        # Ağ seviyesinde kesin 160p kilidi (Master .m3u8 içinden sadece en düşük çözünürlüğü bırak)
+        if ".m3u8" in url and "live-video.net" in url:
+            try:
+                resp = route.fetch()
+                body = resp.text()
+                if "#EXT-X-STREAM-INF" in body:
+                    lines = body.splitlines()
+                    headers, variants = [], []
+                    i = 0
+                    while i < len(lines):
+                        if lines[i].startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                            m_bw = re.search(r"BANDWIDTH=(\d+)", lines[i])
+                            bw = int(m_bw.group(1)) if m_bw else 999999999
+                            variants.append((bw, lines[i], lines[i + 1]))
+                            i += 2
+                        else:
+                            if not variants:
+                                headers.append(lines[i])
+                            i += 1
+                    if variants:
+                        vid_vars = [v for v in variants if "RESOLUTION=" in v[1]]
+                        pool = vid_vars if vid_vars else variants
+                        pool.sort(key=lambda x: x[0])
+                        lowest = pool[0]
+                        new_body = "\n".join(headers + [lowest[1], lowest[2]]) + "\n"
+                        route.fulfill(response=resp, body=new_body)
+                        return
+                route.fulfill(response=resp)
+                return
+            except Exception:
+                route.continue_()
+                return
+
         if (
             "challenges.cloudflare.com" in url or "live-video.net" in url
             or ".m3u8" in url or ".ts" in url or ".m4s" in url
@@ -1581,7 +1615,7 @@ def run_bot(context, state):
                     render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"], banner=f"{reason_tr}, kurtarılıyor..."), get_main_panel_kb(state))
 
                     recovered = False
-                    if len(disconnect_times) < 2:
+                    if len(disconnect_times) < 4:
                         recovered = recover_stream_player(page, state)
 
                     if recovered:
@@ -1592,8 +1626,9 @@ def run_bot(context, state):
                         old_ch = state["current_streamer"]
                         log(f"🚨 Aşama 3: {old_ch} kurtarılamadı / sık kopuyor, yeni GTA VI yayınına geçiliyor...")
                         streamers = fetch_gta6_streamers_strict(context, state)
-                        bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(streamers)
-                        new_ch = streamers[bot_ctx["stream_idx"]]["slug"]
+                        other_streamers = [s for s in streamers if s["slug"] != old_ch] or streamers
+                        bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(other_streamers)
+                        new_ch = other_streamers[bot_ctx["stream_idx"]]["slug"]
                         open_stream(page, new_ch, state, count_switch=True)
                         disconnect_times.clear()
 
