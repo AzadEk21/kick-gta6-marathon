@@ -741,7 +741,6 @@ def setup_resource_blocker(context):
         if any(d in url for d in blocked_domains) or res_type in ("font", "image", "media"):
             route.abort()
             return
-            return
         route.continue_()
     context.route("**/*", route_handler)
 
