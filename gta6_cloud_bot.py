@@ -5,13 +5,17 @@ import json
 import time
 import queue
 import random
+import socket
 import threading
 import warnings
 import traceback
 import requests
+import urllib3.util.connection
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
+# IPv4 önceliği
+urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET
 warnings.filterwarnings("ignore")
 
 try:
@@ -27,6 +31,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY", "").strip()
+CURRENT_RUN_ID = os.environ.get("GITHUB_RUN_ID", f"local-{int(time.time())}")
 
 WORKFLOW_FILE = "gta6_drops.yml"
 STATE_FILE = "marathon_state.json"
@@ -42,6 +47,7 @@ FALLBACK_SLUGS = ["rraenee", "eray", "mithrain", "hype", "elraenn", "cordiseps",
 
 LOG_BUFFER = deque(maxlen=50)
 CMD_QUEUE = queue.Queue()
+TEMP_MESSAGES = []  # [(msg_id, expire_timestamp), ...]
 
 def now_tr():
     return datetime.now(TR_TZ)
@@ -51,9 +57,18 @@ def is_dnd_hours():
     h = now_tr().hour
     return 1 <= h < 9
 
+def sanitize_text(text):
+    """Log ve hata mesajlarındaki Telegram token ve çerez değerlerini otomatik maskeler."""
+    s = str(text)
+    if TELEGRAM_BOT_TOKEN:
+        s = s.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
+    s = re.sub(r"\b\d{6,15}:[A-Za-z0-9_-]{25,60}\b", "***TOKEN***", s)
+    s = re.sub(r"(session_token[\"']?\s*[:=]\s*[\"']?)([^\"'\s,;]+)", r"\1***COOKIE***", s, flags=re.IGNORECASE)
+    return s
+
 def log(msg):
     ts = now_tr().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
+    line = f"[{ts}] {sanitize_text(msg)}"
     print(line, flush=True)
     LOG_BUFFER.append(line)
 
@@ -77,7 +92,7 @@ VISIBILITY_JS = r"""
 """
 
 # ==========================================
-# 3. KALICI HAFIZA (STATE) YÖNETİMİ
+# 3. KALICI HAFIZA (STATE) & ÇİFT SUNUCU KİLİDİ
 # ==========================================
 def load_state():
     today_str = now_tr().strftime("%Y-%m-%d")
@@ -87,7 +102,12 @@ def load_state():
         "remaining_text": "Henüz taranmadı",
         "completed": False,
         "paused": False,
-        "silent_mode": False,
+        "notify_switch": True,
+        "notify_milestone": True,
+        "auto_clean_temp": True,
+        "last_milestone": 0,
+        "active_run_id": "",
+        "health_status": "🟢 Canlı",
         "current_streamer": "Yok",
         "previous_streamer": "",
         "current_title": "Bilinmiyor",
@@ -103,6 +123,7 @@ def load_state():
         "last_update_offset": 0,
         "last_scan_ts": 0.0,
         "last_scan_ratio": 0.0,
+        "hourly_history": [],
         "efficiency_text": "Hesaplanıyor (15 dk içinde netleşir)",
         "last_daily_report_date": today_str,
         "daily_start_ratio": 0.0,
@@ -124,19 +145,47 @@ def save_state(state):
     except Exception as e:
         log(f"⚠️ State yazma hatası: {e}")
 
+def is_session_overtaken():
+    """Başka bir sunucu (yeni run_id) kontrolü devraldı mı kontrol eder."""
+    if not os.path.exists(STATE_FILE):
+        return False
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            disk_state = json.load(f)
+        disk_run = disk_state.get("active_run_id", "")
+        if disk_run and disk_run != CURRENT_RUN_ID:
+            return True
+    except Exception:
+        pass
+    return False
+
 # ==========================================
 # 4. TELEGRAM API & UYGULAMA BENZERİ UI/UX
 # ==========================================
-def tg_api(method, data=None, files=None, timeout=15):
+def tg_api(method, data=None, files=None, timeout=15, retries=2):
     if not TELEGRAM_BOT_TOKEN:
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    try:
-        r = requests.post(url, data=data, files=files, timeout=timeout)
-        if r.ok:
-            return r.json()
-    except Exception as e:
-        log(f"[TG API HATA - {method}] {e}")
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(
+                url,
+                data=data,
+                files=files,
+                headers={"Connection": "close"},
+                timeout=(8, timeout)
+            )
+            if r.ok:
+                return r.json()
+            if r.status_code == 400 and "message is not modified" in r.text.lower():
+                return {"ok": True}
+            log(f"[TG API RED - {method}] HTTP {r.status_code}: {sanitize_text(r.text[:150])}")
+            return None
+        except requests.exceptions.RequestException as e:
+            if attempt == retries:
+                log(f"[TG API HATA - {method}] {sanitize_text(e)}")
+            else:
+                time.sleep(1.5)
     return None
 
 def setup_telegram_menu():
@@ -145,7 +194,7 @@ def setup_telegram_menu():
         {"command": "yayincilar", "description": "📺 Canlı GTA VI yayıncılarını listele"},
         {"command": "ekran", "description": "📸 Kırpılmış canlı yayın ekranı"},
         {"command": "drops", "description": "🎁 SunsetK Badge ilerlemesini tara"},
-        {"command": "ayarlar", "description": "⚙️ Kara liste, favoriler ve sistem"},
+        {"command": "ayarlar", "description": "⚙️ Bildirimler, kara liste ve sistem"},
         {"command": "log", "description": "📜 Son 25 çalışma kaydı"}
     ]
     if TELEGRAM_BOT_TOKEN:
@@ -164,11 +213,11 @@ def answer_toast(cb_id, text, alert=False):
         "callback_query_id": cb_id,
         "text": text[:180],
         "show_alert": "true" if alert else "false"
-    }, timeout=5)
+    }, timeout=5, retries=1)
 
 def delete_message(msg_id):
     if msg_id and TELEGRAM_CHAT_ID:
-        tg_api("deleteMessage", {"chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id}, timeout=8)
+        tg_api("deleteMessage", {"chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id}, timeout=8, retries=1)
 
 def pin_panel_message(msg_id):
     if msg_id and TELEGRAM_CHAT_ID:
@@ -176,39 +225,85 @@ def pin_panel_message(msg_id):
             "chat_id": TELEGRAM_CHAT_ID,
             "message_id": msg_id,
             "disable_notification": "true"
-        }, timeout=8)
+        }, timeout=8, retries=1)
+
+def register_temp_message(msg_id, state):
+    if msg_id and state and state.get("auto_clean_temp", True):
+        TEMP_MESSAGES.append((msg_id, time.time() + 600))  # 10 dakika sonra otomatik sil
+
+def cleanup_expired_temp_messages(state):
+    if not state.get("auto_clean_temp", True) or not TEMP_MESSAGES:
+        return
+    now_ts = time.time()
+    remaining = []
+    for mid, exp_ts in TEMP_MESSAGES:
+        if now_ts >= exp_ts:
+            delete_message(mid)
+        else:
+            remaining.append((mid, exp_ts))
+    TEMP_MESSAGES[:] = remaining
 
 def build_progress_bar(pct, length=10):
     filled = max(0, min(length, int(round((pct / 100.0) * length))))
     return "█" * filled + "░" * (length - filled)
 
-def get_main_panel_text(state, start_time):
+def calc_hourly_gain_min(state):
+    hist = state.get("hourly_history", [])
+    if len(hist) < 2:
+        return None
+    now_ts = time.time()
+    cur_ratio = state.get("progress_ratio", 0.0)
+    # Son 65 dakika içindeki en eski kaydı bul
+    oldest = None
+    for ts, r in hist:
+        if (now_ts - ts) <= 3900:
+            oldest = (ts, r)
+            break
+    if not oldest or (now_ts - oldest[0]) < 300:
+        return None
+    gained = max(0.0, (cur_ratio - oldest[1]) * TOTAL_TARGET_MINUTES)
+    return int(round(gained))
+
+def get_main_panel_text(state, start_time, session_start_ratio=0.0, banner=""):
     elapsed_min = int((time.time() - start_time) // 60)
     pct = state.get("percent", 0.0)
     bar = build_progress_bar(pct)
 
     rem_min = max(0, int(round(TOTAL_TARGET_MINUTES * (1.0 - (pct / 100.0)))))
+    rem_days = rem_min / 1440.0
     eta_dt = now_tr() + timedelta(minutes=rem_min)
     eta_str = eta_dt.strftime("%d.%m.%Y %H:%M") if pct > 0 else "Hesaplanıyor..."
+
+    # Oturumluk ve saatlik ilerleme kıyası
+    sess_gain = 0
+    if session_start_ratio > 0 and state.get("progress_ratio", 0.0) >= session_start_ratio:
+        sess_gain = int(round((state["progress_ratio"] - session_start_ratio) * TOTAL_TARGET_MINUTES))
+    hourly_gain = calc_hourly_gain_min(state)
+    hourly_str = f"+{hourly_gain} dk" if hourly_gain is not None else "Ölçülüyor"
 
     cur = state.get("current_streamer", "Yok")
     is_fav = "⭐ " if cur in state.get("favorites", []) else ""
     title = (state.get("current_title") or "GTA VI")[:55]
     viewers = format_viewers(state.get("current_viewers", 0))
     eff = state.get("efficiency_text", "Hesaplanıyor...")
+    pill = state.get("health_status", "🟢 Canlı")
     dnd = "🌙 DND" if is_dnd_hours() else "☀️ Aktif"
     updated_at = now_tr().strftime("%H:%M:%S")
 
+    banner_line = f"⏳ <b>İşlem:</b> <i>{banner}</i>\n━━━━━━━━━━━━━━━━━━━━━━\n" if banner else ""
+
     return (
-        f"🎮 <b>GTA VI 250 SAAT CANLI PANO</b>  <i>({updated_at})</i>\n"
+        f"{banner_line}"
+        f"🎮 <b>GTA VI 250 SAAT CANLI PANO</b>  {pill}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📺 <b>Kanal:</b> {is_fav}<code>{cur}</code>  (👁️ {viewers})\n"
         f"📝 <b>Başlık:</b> <i>{title}</i>\n"
         f"🎁 <b>SunsetK:</b> <code>{state['remaining_text']}</code>\n"
-        f"📊 <b>İlerleme:</b> <code>[{bar}] %{pct:.2f}</code>\n"
+        f"📊 <b>İlerleme:</b> <code>[{bar}] %{pct:.2f}</code>  (<code>~{rem_days:.1f} gün</code>)\n"
+        f"⚡ <b>Kazanç:</b> Bu Oturum <code>+{sess_gain} dk</code> | Son 1 Sa: <code>{hourly_str}</code>\n"
         f"📈 <b>Verimlilik:</b> <code>{eff}</code>\n"
         f"📅 <b>Tahmini Bitiş:</b> <code>{eta_str}</code>\n"
-        f"🔁 <b>Oturum:</b> <code>#{state['session_count']}</code> | ⏱️ <code>{elapsed_min} dk</code> | {dnd}"
+        f"🔁 <b>Oturum:</b> <code>#{state['session_count']}</code> | ⏱️ <code>{elapsed_min} dk</code> | {dnd} | <i>{updated_at}</i>"
     )
 
 def get_main_panel_kb(state):
@@ -262,14 +357,13 @@ def get_channels_panel_kb(state):
         slug = item["slug"]
         v = item.get("viewers", 0)
         icon = "▶️" if slug == cur else ("⭐" if slug in favs else ("🔥" if v >= 5000 else "🟢"))
-        row.append({"text": f"{icon} {slug} ({format_viewers(v)})", "callback_data": f"watch:{slug}"})
+        row.append({"text": f"{icon} {slug} ({format_viewers(v)})", "callback_data": f"info:{slug}"})
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
 
-    # Sayfalama satırı
     nav_row = []
     if page_idx > 0:
         nav_row.append({"text": "⬅️ Önceki", "callback_data": f"page:{page_idx - 1}"})
@@ -278,38 +372,58 @@ def get_channels_panel_kb(state):
         nav_row.append({"text": "Sonraki ➡️", "callback_data": f"page:{page_idx + 1}"})
     rows.append(nav_row)
 
-    # Dil geçişi ve yenileme
-    lang_btn = "🌍 Global Listeye Geç" if state.get("list_lang", "tr") == "tr" else "🇹🇷 Türkçe Listeye Geç"
+    lang_btn = "🌍 Global Liste" if state.get("list_lang", "tr") == "tr" else "🇹🇷 Türkçe Liste"
     rows.append([
         {"text": lang_btn, "callback_data": "act:toggle_lang"},
-        {"text": "🔄 Listeyi Yenile", "callback_data": "act:refresh_list"}
+        {"text": "🔎 Kanal Ara / Yaz", "callback_data": "act:search_channel"},
+        {"text": "🔄 Yenile", "callback_data": "act:refresh_list"}
     ])
     return {"inline_keyboard": rows}
 
-def get_settings_panel_kb(state):
-    silent_txt = "🔔 Sessiz Mod: AÇIK" if state.get("silent_mode") else "🔕 Sessiz Mod: KAPALI"
-    rows = [
-        [
-            {"text": "🏠 Ana Panel", "callback_data": "tab:home"},
-            {"text": "📺 Kanallar", "callback_data": "tab:channels"},
-            {"text": "⚙️ Ayarlar (Aktif)", "callback_data": "tab:settings"}
-        ],
-        [
-            {"text": silent_txt, "callback_data": "act:toggle_silent"},
-            {"text": "📜 Son Loglar", "callback_data": "act:log"}
-        ],
-        [
-            {"text": f"🚫 Kara Liste ({len(state.get('blacklist', []))})", "callback_data": "tab:blacklist"},
-            {"text": f"⭐ Favoriler ({len(state.get('favorites', []))})", "callback_data": "tab:favorites"}
-        ],
-        [
-            {"text": "♻️ Yeniden Başlat", "callback_data": "confirm:restart"},
-            {"text": "🛑 Maratonu Durdur", "callback_data": "confirm:stop"}
+def get_streamer_detail_kb(slug, state):
+    is_fav = slug in state.get("favorites", [])
+    fav_watch_txt = "▶️ İzle (Favori ⭐)" if is_fav else "⭐ Favoriye Ekle & İzle"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "▶️ Bu Kanalı İzle", "callback_data": f"watch:{slug}"},
+                {"text": fav_watch_txt, "callback_data": f"favwatch:{slug}"}
+            ],
+            [
+                {"text": "🔙 Kanallar Listesine Dön", "callback_data": "tab:channels"}
+            ]
         ]
-    ]
-    return {"inline_keyboard": rows}
+    }
 
-def get_manage_list_kb(items, prefix, title_icon):
+def get_settings_panel_kb(state):
+    sw_txt = "🔄 Kanal Değişimi: AÇIK" if state.get("notify_switch", True) else "🔄 Kanal Değişimi: KAPALI"
+    ms_txt = "📊 %5 Kilometre Taşı: AÇIK" if state.get("notify_milestone", True) else "📊 %5 Kilometre Taşı: KAPALI"
+    ac_txt = "🧹 Oto-Temizlik (10 dk): AÇIK" if state.get("auto_clean_temp", True) else "🧹 Oto-Temizlik: KAPALI"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🏠 Ana Panel", "callback_data": "tab:home"},
+                {"text": "📺 Kanallar", "callback_data": "tab:channels"},
+                {"text": "⚙️ Ayarlar (Aktif)", "callback_data": "tab:settings"}
+            ],
+            [{"text": sw_txt, "callback_data": "act:toggle_notify_switch"}],
+            [{"text": ms_txt, "callback_data": "act:toggle_notify_milestone"}],
+            [
+                {"text": ac_txt, "callback_data": "act:toggle_autoclean"},
+                {"text": "📜 Son Loglar", "callback_data": "act:log"}
+            ],
+            [
+                {"text": f"🚫 Kara Liste ({len(state.get('blacklist', []))})", "callback_data": "tab:blacklist"},
+                {"text": f"⭐ Favoriler ({len(state.get('favorites', []))})", "callback_data": "tab:favorites"}
+            ],
+            [
+                {"text": "♻️ Yeniden Başlat", "callback_data": "confirm:restart"},
+                {"text": "🛑 Maratonu Durdur", "callback_data": "confirm:stop"}
+            ]
+        ]
+    }
+
+def get_manage_list_kb(items, prefix):
     rows = []
     row = []
     for slug in items[:12]:
@@ -338,7 +452,7 @@ def render_panel(state, text, kb, msg_id=None, create_new=False, critical=False)
     if not TELEGRAM_CHAT_ID:
         return None
     target_id = msg_id or state.get("panel_message_id")
-    silent = "true" if (not critical and (state.get("silent_mode") or is_dnd_hours())) else "false"
+    silent = "true" if (not critical and is_dnd_hours()) else "false"
 
     if target_id and not create_new:
         res = tg_api("editMessageText", {
@@ -368,22 +482,28 @@ def render_panel(state, text, kb, msg_id=None, create_new=False, critical=False)
         return new_id
     return None
 
-def send_temp_message(text, critical=False, state=None):
-    """Altında [🗑️ Bu Mesajı Sil] butonu olan geçici bilgi mesajı."""
+def send_temp_message(text, critical=False, state=None, auto_clean=True):
+    """Altında [🗑️ Bu Mesajı Sil] butonu olan ve isteğe bağlı 10 dk sonra otomatik silinen mesaj."""
     if not TELEGRAM_CHAT_ID:
-        return
-    silent = "true" if (not critical and ((state and state.get("silent_mode")) or is_dnd_hours())) else "false"
-    tg_api("sendMessage", {
+        return None
+    silent = "true" if (not critical and is_dnd_hours()) else "false"
+    res = tg_api("sendMessage", {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
+        "text": sanitize_text(text),
         "parse_mode": "HTML",
         "disable_web_page_preview": "true",
         "disable_notification": silent,
         "reply_markup": json.dumps({"inline_keyboard": [[{"text": "🗑️ Bu Mesajı Sil", "callback_data": "act:del_msg"}]]})
     })
+    if res and res.get("ok"):
+        mid = res["result"]["message_id"]
+        if auto_clean:
+            register_temp_message(mid, state)
+        return mid
+    return None
 
 def send_cropped_screenshot(page, caption, critical=False, state=None):
-    """Mobil uyumlu kırpılmış video oynatıcı ekran görüntüsü + [🗑️ Bu Mesajı Sil] butonu."""
+    """Mobil uyumlu kırpılmış video oynatıcı ekran görüntüsü + 10 dk otomatik temizlik."""
     if not TELEGRAM_CHAT_ID:
         return
     path = "live_screen.png"
@@ -395,24 +515,32 @@ def send_cropped_screenshot(page, caption, critical=False, state=None):
         else:
             page.screenshot(path=path, full_page=False)
 
-        silent = "true" if (not critical and ((state and state.get("silent_mode")) or is_dnd_hours())) else "false"
+        silent = "true" if (not critical and is_dnd_hours()) else "false"
         with open(path, "rb") as photo:
-            tg_api("sendPhoto", data={
+            res = tg_api("sendPhoto", data={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "caption": caption[:1000],
+                "caption": sanitize_text(caption)[:1000],
                 "parse_mode": "HTML",
                 "disable_notification": silent,
                 "reply_markup": json.dumps({"inline_keyboard": [[{"text": "🗑️ Bu Mesajı Sil", "callback_data": "act:del_msg"}]]})
             }, files={"photo": photo}, timeout=25)
+            if res and res.get("ok") and not critical:
+                register_temp_message(res["result"]["message_id"], state)
     except Exception as e:
         log(f"⚠️ Ekran görüntüsü hatası: {e}")
 
 # ==========================================
-# 5. ARKA PLAN TELEGRAM DİNLEYİCİSİ (SIFIR GECİKME)
+# 5. ARKA PLAN TELEGRAM DİNLEYİCİSİ (WHITELIST + COOLDOWN)
 # ==========================================
 def telegram_listener_thread(state_ref, stop_event):
-    """Tarayıcı meşgulken bile Telegram butonlarına anında (<0.5sn) toast tepkisi verir ve kuyruğa atar."""
+    """
+    Sıkı chat_id + from.id beyaz listesi (Hayalet Mod) ve
+    kuyruk taşma/spam koruması (Cooldown) ile arka planda dinler.
+    """
     offset = state_ref.get("last_update_offset", 0)
+    last_action_ts = {}
+    heavy_actions = {"act:next", "act:prev", "act:drops", "act:refresh_list", "act:toggle_lang", "act:screen"}
+
     while not stop_event.is_set():
         if not TELEGRAM_BOT_TOKEN:
             time.sleep(5)
@@ -421,6 +549,7 @@ def telegram_listener_thread(state_ref, stop_event):
             r = requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
                 params={"offset": offset + 1, "timeout": 10},
+                headers={"Connection": "close"},
                 timeout=15
             )
             if not r.ok:
@@ -432,6 +561,13 @@ def telegram_listener_thread(state_ref, stop_event):
 
                 if "callback_query" in upd:
                     cb = upd["callback_query"]
+                    from_id = str(cb.get("from", {}).get("id", ""))
+                    chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+
+                    # Sıkı Beyaz Liste (Hayalet Mod)
+                    if TELEGRAM_CHAT_ID and (from_id != str(TELEGRAM_CHAT_ID) or chat_id != str(TELEGRAM_CHAT_ID)):
+                        continue
+
                     cb_id = cb["id"]
                     data = (cb.get("data") or "").strip()
                     msg_id = cb.get("message", {}).get("message_id")
@@ -444,10 +580,16 @@ def telegram_listener_thread(state_ref, stop_event):
                         delete_message(msg_id)
                         continue
 
-                    # Anında görsel geri bildirim (Toast)
+                    # Spam / Cooldown Koruması (Ağır işlemlerde 3 sn bekleme)
+                    now_ts = time.time()
+                    if data in heavy_actions and (now_ts - last_action_ts.get(data, 0)) < 3.0:
+                        answer_toast(cb_id, "⏳ Bu işlem zaten sıraya alındı, lütfen bekle...")
+                        continue
+                    last_action_ts[data] = now_ts
+
                     toast_map = {
                         "tab:home": "🏠 Ana Panel",
-                        "tab:channels": "📺 Kanallar yükleniyor...",
+                        "tab:channels": "📺 Kanallar açılıyor...",
                         "tab:settings": "⚙️ Ayarlar",
                         "act:drops": "🎁 Drops taranıyor...",
                         "act:screen": "📸 Ekran görüntüsü alınıyor...",
@@ -455,19 +597,29 @@ def telegram_listener_thread(state_ref, stop_event):
                         "act:prev": "↩️ Önceki kanala dönülüyor...",
                         "act:refresh_list": "🔄 Canlı GTA VI listesi yenileniyor...",
                         "act:toggle_lang": "🌍 Dil filtresi değiştiriliyor...",
+                        "act:search_channel": "🔎 Kanal adını yazıp gönder...",
                         "act:log": "📜 Loglar getiriliyor..."
                     }
                     answer_toast(cb_id, toast_map.get(data, "⏳ İşleniyor..."))
                     CMD_QUEUE.put(("cb", data, msg_id))
 
                 elif "message" in upd and "text" in upd["message"]:
-                    txt = upd["message"]["text"].strip()
-                    CMD_QUEUE.put(("msg", txt, None))
+                    msg = upd["message"]
+                    from_id = str(msg.get("from", {}).get("id", ""))
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                    # Sıkı Beyaz Liste (Hayalet Mod)
+                    if TELEGRAM_CHAT_ID and (from_id != str(TELEGRAM_CHAT_ID) or chat_id != str(TELEGRAM_CHAT_ID)):
+                        continue
+
+                    txt = msg["text"].strip()
+                    reply_to = msg.get("reply_to_message", {}).get("text", "")
+                    CMD_QUEUE.put(("msg", txt, reply_to))
         except Exception:
             time.sleep(2)
 
 # ==========================================
-# 6. CLOUDFLARE, KAYNAK ENGELLEYİCİ & ÇEREZ
+# 6. CLOUDFLARE, KAYNAK ENGELLEYİCİ & ÇEREZ EXPIRY
 # ==========================================
 def bypass_cloudflare(page):
     for attempt in range(4):
@@ -528,11 +680,16 @@ def setup_resource_blocker(context):
         route.continue_()
     context.route("**/*", route_handler)
 
-def parse_and_load_cookies(context):
+def parse_and_load_cookies(context, state):
+    """Çerezleri yükler ve oturum çerezlerinin son kullanma tarihini (24 sa uyarısı) kontrol eder."""
     if not KICK_COOKIES_RAW:
         log("❌ KICK_COOKIES_JSON secret bulunamadı!")
         return False
+
     cookies_to_add = []
+    expiring_soon = []
+    now_ts = time.time()
+
     try:
         raw_list = json.loads(KICK_COOKIES_RAW)
         if isinstance(raw_list, dict) and "cookies" in raw_list:
@@ -545,6 +702,14 @@ def parse_and_load_cookies(context):
                 domain = c.get("domain", ".kick.com")
                 if "kick.com" not in domain:
                     continue
+
+                # Çerez geçerlilik süresi (expirationDate) kontrolü
+                exp = c.get("expirationDate")
+                if exp and any(k in str(name).lower() for k in ("session", "token", "auth", "kick")):
+                    rem_sec = float(exp) - now_ts
+                    if 0 < rem_sec < 86400:
+                        expiring_soon.append((str(name), round(rem_sec / 3600.0, 1)))
+
                 cookies_to_add.append({
                     "name": str(name), "value": str(value),
                     "domain": domain if domain.startswith(".") else f".{domain}",
@@ -553,9 +718,19 @@ def parse_and_load_cookies(context):
                 })
     except Exception:
         pass
+
     if cookies_to_add:
         context.add_cookies(cookies_to_add)
         log(f"✅ {len(cookies_to_add)} adet Kick çerezi yüklendi.")
+        if expiring_soon:
+            details = ", ".join(f"{n} (~{h} sa)" for n, h in expiring_soon[:3])
+            log(f"⚠️ Çerez süresi dolmak üzere: {details}")
+            send_temp_message(
+                f"⚠️ <b>ÇEREZ SÜRESİ UYARISI!</b>\n"
+                f"Kick oturum çerezlerinin süresi 24 saatten az kaldı: <code>{details}</code>\n"
+                f"Oturum düşmeden önce <code>KICK_COOKIES_JSON</code> değerini yenilemen önerilir.",
+                critical=True, state=state, auto_clean=False
+            )
         return True
     return False
 
@@ -574,13 +749,38 @@ def check_session_authenticated(page):
         return True
 
 # ==========================================
-# 7. SADECE GERÇEK GTA VI YAYINCILARINI ÇEKME (DÜZELTİLDİ)
+# 7. SADECE GERÇEK GTA VI YAYINCILARINI ÇEKME & TEKİL DOĞRULAMA
 # ==========================================
+def fetch_single_channel_info(page, slug):
+    """Tek bir kanalın canlılık, GTA VI kategorisi, başlık, izleyici ve drops bilgisini çeker."""
+    try:
+        return page.evaluate(f"""async () => {{
+            try {{
+                const r = await fetch('https://kick.com/api/v2/channels/{slug}');
+                if (!r.ok) return null;
+                const d = await r.json();
+                if (!d || !d.livestream || !d.livestream.is_live) return {{ slug: '{slug}', is_live: false }};
+                const cats = d.livestream.categories || [];
+                const isGta6 = cats.some(c =>
+                    (c.slug || '').toLowerCase().includes('grand-theft-auto-vi') ||
+                    (c.name || '').toLowerCase().includes('grand theft auto vi')
+                );
+                const tags = (d.livestream.tags || []).map(t => String(t).toLowerCase());
+                const dropsActive = isGta6 || tags.some(t => t.includes('drop'));
+                return {{
+                    slug: '{slug}',
+                    is_live: true,
+                    is_gta6: isGta6,
+                    drops_active: dropsActive,
+                    viewers: d.livestream.viewer_count || 0,
+                    title: d.livestream.session_title || 'GTA VI'
+                }};
+            }} catch(e) {{ return null; }}
+        }}""")
+    except Exception:
+        return None
+
 def fetch_gta6_streamers_strict(context, state):
-    """
-    Sadece <main> içindeki kategori kartlarını tarar ve her kanalı Kick API'den
-    doğrulayarak SADECE 'grand-theft-auto-vi' oynayan canlı yayıncıları döner.
-    """
     lang = state.get("list_lang", "tr")
     url = GTA6_TR_URL if lang == "tr" else GTA6_GLOBAL_URL
     bl_set = set(s.lower() for s in state.get("blacklist", []))
@@ -595,7 +795,6 @@ def fetch_gta6_streamers_strict(context, state):
         bypass_cloudflare(scan_page)
         scan_page.wait_for_timeout(4000)
 
-        # SADECE <main> alanından çek (sol menüdeki başka oyun oynayanları asla alma!)
         dom_slugs = scan_page.evaluate(r"""() => {
             const ignore = new Set([
                 'categories', 'category', 'drops', 'browse', 'following',
@@ -618,33 +817,14 @@ def fetch_gta6_streamers_strict(context, state):
             if s not in bl_set and s not in candidates:
                 candidates.append(s)
 
-        # Favorileri de başa ekleyip kontrol et
         for f in fav_set:
             if f not in bl_set and f not in candidates:
                 candidates.insert(0, f)
 
         verified = []
         for slug in candidates[:18]:
-            info = scan_page.evaluate(f"""async () => {{
-                try {{
-                    const r = await fetch('https://kick.com/api/v2/channels/{slug}');
-                    if (!r.ok) return null;
-                    const d = await r.json();
-                    if (!d || !d.livestream || !d.livestream.is_live) return null;
-                    const cats = d.livestream.categories || [];
-                    const isGta6 = cats.some(c =>
-                        (c.slug || '').toLowerCase().includes('grand-theft-auto-vi') ||
-                        (c.name || '').toLowerCase().includes('grand theft auto vi')
-                    );
-                    if (!isGta6) return null;
-                    return {{
-                        slug: '{slug}',
-                        viewers: d.livestream.viewer_count || 0,
-                        title: d.livestream.session_title || 'GTA VI'
-                    }};
-                }} catch(e) {{ return null; }}
-            }}""")
-            if info:
+            info = fetch_single_channel_info(scan_page, slug)
+            if info and info.get("is_live") and info.get("is_gta6"):
                 verified.append(info)
 
         scan_page.close()
@@ -658,9 +838,8 @@ def fetch_gta6_streamers_strict(context, state):
         verified = []
 
     if not verified:
-        verified = [{"slug": s, "viewers": 0, "title": "GTA VI"} for s in FALLBACK_SLUGS if s not in bl_set]
+        verified = [{"slug": s, "viewers": 0, "title": "GTA VI", "drops_active": True} for s in FALLBACK_SLUGS if s not in bl_set]
     else:
-        # Favoriler en üstte, sonra izleyici sayısına göre büyükten küçüğe sırala
         verified.sort(key=lambda x: (x["slug"] in fav_set, x["viewers"]), reverse=True)
 
     state["cached_streamers"] = verified
@@ -669,7 +848,7 @@ def fetch_gta6_streamers_strict(context, state):
     return verified
 
 # ==========================================
-# 8. DROPS TARAYICI + ANLIK VERİMLİLİK ÖLÇER
+# 8. DROPS TARAYICI + VERİMLİLİK + %5 KİLOMETRE TAŞI
 # ==========================================
 def scan_and_claim_drops(context, state):
     drop_page = None
@@ -725,7 +904,12 @@ def scan_and_claim_drops(context, state):
             if state.get("daily_start_ratio", 0.0) == 0.0:
                 state["daily_start_ratio"] = ratio
 
-            # En az 3 dakika (180 sn) geçmişse verimliliği hesapla
+            # Saatlik geçmişi güncelle (son 2 saati tut)
+            hist = state.get("hourly_history", [])
+            hist.append([now_ts, ratio])
+            state["hourly_history"] = [x for x in hist if (now_ts - x[0]) <= 7200][-20:]
+
+            # Verimlilik hesabı (en az 3 dakika geçmişse)
             if last_ts > 0 and (now_ts - last_ts) >= 180:
                 real_min = (now_ts - last_ts) / 60.0
                 gained_min = max(0.0, (ratio - last_ratio) * TOTAL_TARGET_MINUTES)
@@ -735,8 +919,11 @@ def scan_and_claim_drops(context, state):
 
             if old_ratio > 0 and ratio <= old_ratio:
                 state["stuck_scans"] = state.get("stuck_scans", 0) + 1
+                if state["stuck_scans"] >= 2:
+                    state["health_status"] = "🔴 Takılma Uyarısı"
             else:
                 state["stuck_scans"] = 0
+                state["health_status"] = "🟢 Canlı"
 
             pct = round(ratio * 100.0, 2)
             watched_min = int(round(ratio * TOTAL_TARGET_MINUTES))
@@ -746,6 +933,18 @@ def scan_and_claim_drops(context, state):
             state["last_scan_ts"] = now_ts
             state["last_scan_ratio"] = ratio
             state["remaining_text"] = f"{rem_min // 60} sa. {rem_min % 60} dk. kaldı (İzlenen: {watched_min // 60} sa. {watched_min % 60} dk.)"
+
+            # %5 İlerleme Kilometre Taşı Bildirimi
+            current_milestone = int(pct // 5) * 5
+            if current_milestone >= 5 and current_milestone > state.get("last_milestone", 0):
+                state["last_milestone"] = current_milestone
+                if state.get("notify_milestone", True):
+                    send_temp_message(
+                        f"🎯 <b>KİLOMETRE TAŞI: %{current_milestone} GEÇİLDİ!</b>\n"
+                        f"🎁 <code>{state['remaining_text']}</code>",
+                        critical=False, state=state, auto_clean=False
+                    )
+
             save_state(state)
             summary = f"{state['remaining_text']} (%{pct:.2f})"
             log(f"🎁 Drops: {summary} | Verimlilik: {state['efficiency_text']}")
@@ -789,7 +988,6 @@ def open_stream(page, slug, state, count_switch=False):
             v.muted = true;
             v.play().catch(() => {});
         }
-        // Sohbet panelini kapat/boşalt (RAM koruması)
         ['#channel-chatroom', '[data-testid="chatroom"]', 'aside'].forEach(sel => {
             document.querySelectorAll(sel).forEach(el => {
                 if ((el.innerText || '').toLowerCase().includes('sohbet') || (el.innerText || '').toLowerCase().includes('chat') || sel.includes('chat')) {
@@ -811,19 +1009,12 @@ def open_stream(page, slug, state, count_switch=False):
     except Exception:
         pass
 
-    meta = page.evaluate(f"""async () => {{
-        try {{
-            const r = await fetch('https://kick.com/api/v2/channels/{slug}');
-            if (!r.ok) return null;
-            const d = await r.json();
-            return d && d.livestream ? {{ viewers: d.livestream.viewer_count || 0, title: d.livestream.session_title || 'GTA VI' }} : null;
-        }} catch(e) {{ return null; }}
-    }}""")
-
+    meta = fetch_single_channel_info(page, slug)
     state["current_streamer"] = slug
-    if meta:
-        state["current_viewers"] = meta["viewers"]
-        state["current_title"] = meta["title"]
+    state["health_status"] = "🟢 Canlı"
+    if meta and meta.get("is_live"):
+        state["current_viewers"] = meta.get("viewers", 0)
+        state["current_title"] = meta.get("title", "GTA VI")
     save_state(state)
 
 def check_stream_health(page, state, last_video_time):
@@ -880,7 +1071,7 @@ def check_daily_report(state):
             f"📊 <b>Toplam İlerleme:</b> <code>%{state.get('percent', 0.0):.2f}</code>\n"
             f"📅 <b>Hedefe Kalan Tahmini Gün:</b> <code>~{rem_days} gün</code>"
         )
-        send_temp_message(msg, critical=True, state=state)
+        send_temp_message(msg, critical=True, state=state, auto_clean=False)
         state["last_daily_report_date"] = today_str
         state["daily_start_ratio"] = state.get("progress_ratio", 0.0)
         state["daily_channel_switches"] = 0
@@ -909,64 +1100,136 @@ def trigger_next_workflow(state, reason="5.4 saatlik oturum tamamlandı"):
 # ==========================================
 def process_queued_commands(page, context, bot_ctx):
     state = bot_ctx["state"]
-    while not CMD_QUEUE.empty():
-        kind, payload, msg_id = CMD_QUEUE.get_nowait()
+    sess_ratio = bot_ctx["session_start_ratio"]
 
+    # Kuyruktaki tüm bekleyen komutları çek ve aynı ağır komutları birleştir (deduplication)
+    pending = []
+    seen_heavy = set()
+    while not CMD_QUEUE.empty():
+        item = CMD_QUEUE.get_nowait()
+        kind, payload, extra = item
+        if kind == "cb" and payload in ("act:next", "act:drops", "act:refresh_list", "act:screen"):
+            if payload in seen_heavy:
+                continue
+            seen_heavy.add(payload)
+        pending.append(item)
+
+    for kind, payload, extra in pending:
         if kind == "msg":
-            cmd = payload.lower()
+            txt = payload
+            reply_to = extra or ""
+            cmd = txt.lower()
+
+            # ForceReply ile gelen kanal arama cevabı
+            if bot_ctx.get("awaiting_channel_reply") or "kanal adını yaz" in reply_to.lower():
+                bot_ctx["awaiting_channel_reply"] = False
+                if not cmd.startswith("/"):
+                    target = re.sub(r"[^a-zA-Z0-9_]", "", txt.strip().lower())
+                    if target:
+                        info = fetch_single_channel_info(page, target)
+                        if info and info.get("is_live") and info.get("is_gta6"):
+                            open_stream(page, target, state, count_switch=True)
+                            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), critical=True)
+                            send_temp_message(f"✅ <code>{target}</code> doğrulandı (GTA VI canlı) ve açıldı!", critical=True, state=state)
+                        elif info and info.get("is_live"):
+                            send_temp_message(f"⚠️ <code>{target}</code> şu an canlı ama <b>GTA VI</b> kategorisinde değil!", critical=True, state=state)
+                        else:
+                            send_temp_message(f"❌ <code>{target}</code> şu an yayında değil veya bulunamadı.", critical=True, state=state)
+                    continue
+
             if cmd.startswith("/durum") or cmd.startswith("/start"):
-                render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), create_new=True, critical=True)
+                render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), create_new=True, critical=True)
             elif cmd.startswith("/yayincilar"):
                 if not state.get("cached_streamers"):
                     fetch_gta6_streamers_strict(context, state)
                 lang_label = "🇹🇷 Türkçe" if state.get("list_lang", "tr") == "tr" else "🌍 Global"
-                render_panel(state, f"📺 <b>CANLI GTA VI YAYINCILARI ({lang_label})</b>\nGeçmek istediğin kanala dokun:", get_channels_panel_kb(state), create_new=True, critical=True)
+                render_panel(state, f"📺 <b>CANLI GTA VI YAYINCILARI ({lang_label})</b>\nDetay ve seçim için kanala dokun:", get_channels_panel_kb(state), create_new=True, critical=True)
             elif cmd.startswith("/ayarlar"):
-                render_panel(state, "⚙️ <b>BOT AYARLARI VE YÖNETİM</b>\nAşağıdan istediğin ayarı seç:", get_settings_panel_kb(state), create_new=True, critical=True)
+                render_panel(state, "⚙️ <b>BOT AYARLARI VE BİLDİRİM TERCİHLERİ</b>\n<i>🚨 Kritik Uyarılar (Oturum/Takılma): Her Zaman Açık</i>", get_settings_panel_kb(state), create_new=True, critical=True)
             elif cmd.startswith("/ekran"):
                 send_cropped_screenshot(page, f"📸 <b>Canlı Yayın:</b> <code>{state['current_streamer']}</code>", critical=True, state=state)
             elif cmd.startswith("/drops"):
+                render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio, banner="SunsetK Badge taranıyor..."), get_main_panel_kb(state), critical=True)
                 scan_and_claim_drops(context, state)
-                render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), critical=True)
+                render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), critical=True)
             elif cmd.startswith("/log"):
                 logs_txt = "\n".join(list(LOG_BUFFER)[-25:]) or "Henüz log yok."
                 send_temp_message(f"📜 <b>Son 25 Log Satırı:</b>\n<pre>{logs_txt[-3500:]}</pre>", critical=True, state=state)
             elif cmd.startswith("/izle "):
-                target = payload.split(" ", 1)[1].strip().lower()
+                target = txt.split(" ", 1)[1].strip().lower()
                 if target:
                     open_stream(page, target, state, count_switch=True)
-                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), critical=True)
+                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), critical=True)
             continue
 
-        # Callback (Buton) İşlemleri -> Tek Mesajda Canlı Güncelleme
+        # Callback (Buton) İşlemleri
         data = payload
+        msg_id = extra
+
         if data == "tab:home":
-            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data == "tab:channels":
             if not state.get("cached_streamers"):
                 fetch_gta6_streamers_strict(context, state)
             lang_label = "🇹🇷 Türkçe" if state.get("list_lang", "tr") == "tr" else "🌍 Global"
-            render_panel(state, f"📺 <b>CANLI GTA VI YAYINCILARI ({lang_label})</b>\n<i>Sadece doğrulanmış GTA VI yayınları listelenir:</i>", get_channels_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, f"📺 <b>CANLI GTA VI YAYINCILARI ({lang_label})</b>\n<i>Detay görmek ve izlemek için kanala dokun:</i>", get_channels_panel_kb(state), msg_id=msg_id, critical=True)
+
+        elif data.startswith("info:"):
+            # Akıllı Yayıncı Kartı & Seçim Detayı
+            slug = data.split(":", 1)[1]
+            item = next((x for x in state.get("cached_streamers", []) if x["slug"] == slug), None)
+            if not item:
+                item = fetch_single_channel_info(page, slug) or {"slug": slug, "viewers": 0, "title": "GTA VI", "drops_active": True}
+            drops_str = "✅ Aktif (GTA VI)" if item.get("drops_active", True) else "⚠️ Belirsiz"
+            card_txt = (
+                f"📺 <b>YAYINCI DETAY KARTI</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>Kanal:</b> <code>{slug}</code>\n"
+                f"👁️ <b>İzleyici:</b> <code>{format_viewers(item.get('viewers', 0))}</code>\n"
+                f"🎁 <b>Drops Durumu:</b> {drops_str}\n"
+                f"📝 <b>Başlık:</b> <i>{(item.get('title') or 'GTA VI')[:90]}</i>"
+            )
+            render_panel(state, card_txt, get_streamer_detail_kb(slug, state), msg_id=msg_id, critical=True)
+
+        elif data.startswith("watch:") or data.startswith("favwatch:"):
+            target = data.split(":", 1)[1]
+            if data.startswith("favwatch:") and target not in state.get("favorites", []):
+                state.setdefault("favorites", []).append(target)
+                save_state(state)
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio, banner=f"{target} kanalına bağlanılıyor..."), get_main_panel_kb(state), msg_id=msg_id, critical=True)
+            open_stream(page, target, state, count_switch=True)
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), msg_id=msg_id, critical=True)
+
+        elif data == "act:search_channel":
+            bot_ctx["awaiting_channel_reply"] = True
+            res = tg_api("sendMessage", {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": "🔎 <b>Hızlı Kanal Arama</b>\nİzlemek istediğin Kick yayıncısının <b>kanal adını yaz</b> ve gönder (örn: <code>rraenee</code>):",
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps({"force_reply": True, "input_field_placeholder": "Kanal adını yaz..."})
+            })
+            if res and res.get("ok"):
+                register_temp_message(res["result"]["message_id"], state)
 
         elif data == "tab:settings":
-            render_panel(state, "⚙️ <b>BOT AYARLARI VE YÖNETİM</b>\n<i>Tüm ayarlar kalıcı hafızaya kaydedilir:</i>", get_settings_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, "⚙️ <b>BOT AYARLARI VE BİLDİRİM TERCİHLERİ</b>\n<i>🚨 Kritik Uyarılar (Oturum/Takılma): Her Zaman Açık</i>", get_settings_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data == "tab:blacklist":
             bl = state.get("blacklist", [])
             txt = "🚫 <b>KARA LİSTE</b>\nEngelini kaldırmak istediğin kanala tıkla:" if bl else "🚫 <b>KARA LİSTE BOŞ</b>"
-            render_panel(state, txt, get_manage_list_kb(bl, "unblock", "🚫"), msg_id=msg_id, critical=True)
+            render_panel(state, txt, get_manage_list_kb(bl, "unblock"), msg_id=msg_id, critical=True)
 
         elif data == "tab:favorites":
             favs = state.get("favorites", [])
             txt = "⭐ <b>FAVORİ KANALLAR</b>\nFavoriden çıkarmak istediğin kanala tıkla:" if favs else "⭐ <b>FAVORİ LİSTESİ BOŞ</b>"
-            render_panel(state, txt, get_manage_list_kb(favs, "unfav", "⭐"), msg_id=msg_id, critical=True)
+            render_panel(state, txt, get_manage_list_kb(favs, "unfav"), msg_id=msg_id, critical=True)
 
         elif data.startswith("page:"):
             state["list_page"] = int(data.split(":")[1])
             save_state(state)
             lang_label = "🇹🇷 Türkçe" if state.get("list_lang", "tr") == "tr" else "🌍 Global"
-            render_panel(state, f"📺 <b>CANLI GTA VI YAYINCILARI ({lang_label})</b>\n<i>Sadece doğrulanmış GTA VI yayınları listelenir:</i>", get_channels_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, f"📺 <b>CANLI GTA VI YAYINCILARI ({lang_label})</b>\n<i>Detay görmek ve izlemek için kanala dokun:</i>", get_channels_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data == "act:toggle_lang":
             state["list_lang"] = "global" if state.get("list_lang", "tr") == "tr" else "tr"
@@ -981,26 +1244,24 @@ def process_queued_commands(page, context, bot_ctx):
             lang_label = "🇹🇷 Türkçe" if state.get("list_lang", "tr") == "tr" else "🌍 Global"
             render_panel(state, f"📺 <b>CANLI GTA VI YAYINCILARI ({lang_label})</b>\n<i>Az önce yenilendi ({now_tr().strftime('%H:%M:%S')}):</i>", get_channels_panel_kb(state), msg_id=msg_id, critical=True)
 
-        elif data.startswith("watch:"):
-            target = data.split(":", 1)[1]
-            open_stream(page, target, state, count_switch=True)
-            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), msg_id=msg_id, critical=True)
-
         elif data == "act:next":
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio, banner="Yeni GTA VI yayınına bağlanılıyor..."), get_main_panel_kb(state), msg_id=msg_id, critical=True)
             streamers = state.get("cached_streamers") or fetch_gta6_streamers_strict(context, state)
             bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(streamers)
             open_stream(page, streamers[bot_ctx["stream_idx"]]["slug"], state, count_switch=True)
-            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data == "act:prev":
             prev = state.get("previous_streamer")
             if prev:
+                render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio, banner=f"{prev} kanalına dönülüyor..."), get_main_panel_kb(state), msg_id=msg_id, critical=True)
                 open_stream(page, prev, state, count_switch=True)
-            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data == "act:drops":
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio, banner="SunsetK Badge ilerlemesi taranıyor..."), get_main_panel_kb(state), msg_id=msg_id, critical=True)
             scan_and_claim_drops(context, state)
-            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data == "act:screen":
             send_cropped_screenshot(page, f"📸 <b>Canlı Yayın:</b> <code>{state['current_streamer']}</code> (👁️ {format_viewers(state['current_viewers'])})", critical=True, state=state)
@@ -1014,35 +1275,46 @@ def process_queued_commands(page, context, bot_ctx):
                 else:
                     favs.append(cur)
                 save_state(state)
-            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data == "act:block_cur":
             cur = state.get("current_streamer", "")
             if cur and cur != "Yok" and cur not in state["blacklist"]:
                 state["blacklist"].append(cur)
                 save_state(state)
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio, banner=f"{cur} engellendi, yeni kanala geçiliyor..."), get_main_panel_kb(state), msg_id=msg_id, critical=True)
             streamers = fetch_gta6_streamers_strict(context, state)
             open_stream(page, streamers[0]["slug"], state, count_switch=True)
-            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], sess_ratio), get_main_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data.startswith("unblock:"):
             target = data.split(":", 1)[1]
             if target in state.get("blacklist", []):
                 state["blacklist"].remove(target)
                 save_state(state)
-            render_panel(state, "🚫 <b>KARA LİSTE GÜNCELLENDİ</b>", get_manage_list_kb(state["blacklist"], "unblock", "🚫"), msg_id=msg_id, critical=True)
+            render_panel(state, "🚫 <b>KARA LİSTE GÜNCELLENDİ</b>", get_manage_list_kb(state["blacklist"], "unblock"), msg_id=msg_id, critical=True)
 
         elif data.startswith("unfav:"):
             target = data.split(":", 1)[1]
             if target in state.get("favorites", []):
                 state["favorites"].remove(target)
                 save_state(state)
-            render_panel(state, "⭐ <b>FAVORİLER GÜNCELLENDİ</b>", get_manage_list_kb(state["favorites"], "unfav", "⭐"), msg_id=msg_id, critical=True)
+            render_panel(state, "⭐ <b>FAVORİLER GÜNCELLENDİ</b>", get_manage_list_kb(state["favorites"], "unfav"), msg_id=msg_id, critical=True)
 
-        elif data == "act:toggle_silent":
-            state["silent_mode"] = not state.get("silent_mode", False)
+        elif data == "act:toggle_notify_switch":
+            state["notify_switch"] = not state.get("notify_switch", True)
             save_state(state)
-            render_panel(state, "⚙️ <b>BOT AYARLARI VE YÖNETİM</b>", get_settings_panel_kb(state), msg_id=msg_id, critical=True)
+            render_panel(state, "⚙️ <b>BOT AYARLARI VE BİLDİRİM TERCİHLERİ</b>\n<i>🚨 Kritik Uyarılar: Her Zaman Açık</i>", get_settings_panel_kb(state), msg_id=msg_id, critical=True)
+
+        elif data == "act:toggle_notify_milestone":
+            state["notify_milestone"] = not state.get("notify_milestone", True)
+            save_state(state)
+            render_panel(state, "⚙️ <b>BOT AYARLARI VE BİLDİRİM TERCİHLERİ</b>\n<i>🚨 Kritik Uyarılar: Her Zaman Açık</i>", get_settings_panel_kb(state), msg_id=msg_id, critical=True)
+
+        elif data == "act:toggle_autoclean":
+            state["auto_clean_temp"] = not state.get("auto_clean_temp", True)
+            save_state(state)
+            render_panel(state, "⚙️ <b>BOT AYARLARI VE BİLDİRİM TERCİHLERİ</b>\n<i>🚨 Kritik Uyarılar: Her Zaman Açık</i>", get_settings_panel_kb(state), msg_id=msg_id, critical=True)
 
         elif data == "act:log":
             logs_txt = "\n".join(list(LOG_BUFFER)[-25:]) or "Henüz log yok."
@@ -1072,15 +1344,22 @@ def run_bot(context, state):
     setup_resource_blocker(context)
     setup_telegram_menu()
 
-    if not parse_and_load_cookies(context):
-        send_temp_message("❌ <b>KRİTİK HATA:</b> KICK_COOKIES_JSON okunamadı!", critical=True, state=state)
+    if not parse_and_load_cookies(context, state):
+        send_temp_message("❌ <b>KRİTİK HATA:</b> KICK_COOKIES_JSON okunamadı!", critical=True, state=state, auto_clean=False)
         return
 
     stop_event = threading.Event()
     tg_thread = threading.Thread(target=telegram_listener_thread, args=(state, stop_event), daemon=True)
     tg_thread.start()
 
-    bot_ctx = {"state": state, "start_time": time.time(), "stream_idx": 0, "force_exit": False}
+    bot_ctx = {
+        "state": state,
+        "start_time": time.time(),
+        "session_start_ratio": state.get("progress_ratio", 0.0),
+        "stream_idx": 0,
+        "force_exit": False,
+        "awaiting_channel_reply": False
+    }
     page = context.pages[0] if context.pages else context.new_page()
 
     try:
@@ -1091,10 +1370,14 @@ def run_bot(context, state):
             send_cropped_screenshot(page, "⚠️ <b>KRİTİK UYARI:</b> Kick oturumu düşmüş görünüyor! Lütfen <code>KICK_COOKIES_JSON</code> değerini yenile.", critical=True, state=state)
 
         scan_and_claim_drops(context, state)
-        render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state))
+        if bot_ctx["session_start_ratio"] == 0.0:
+            bot_ctx["session_start_ratio"] = state.get("progress_ratio", 0.0)
+
+        render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"]), get_main_panel_kb(state))
 
         last_health = time.time()
         last_drops = time.time()
+        last_lock_check = time.time()
         last_video_time = -1
 
         while (time.time() - bot_ctx["start_time"]) < MAX_RUN_SECONDS:
@@ -1102,7 +1385,16 @@ def run_bot(context, state):
                 break
 
             process_queued_commands(page, context, bot_ctx)
+            cleanup_expired_temp_messages(state)
             check_daily_report(state)
+
+            # Çift Sunucu Çakışma Kilidi (Her 30 sn)
+            if (time.time() - last_lock_check) > 30:
+                last_lock_check = time.time()
+                if is_session_overtaken():
+                    log("🔒 Yeni bir sunucu (active_run_id) kontrolü devraldı, bu oturum sessizce kapanıyor.")
+                    bot_ctx["force_exit"] = True
+                    break
 
             # Her 3 dakikada bir yayın sağlığı, kategori ve donma kontrolü
             if (time.time() - last_health) > 180:
@@ -1112,22 +1404,35 @@ def run_bot(context, state):
                 if status in ("offline", "wrong_game"):
                     reason = "yayını kapattı" if status == "offline" else "GTA VI'dan başka oyuna geçti"
                     log(f"⚠️ {state['current_streamer']} {reason}, yeni GTA VI kanalına geçiliyor...")
+                    state["health_status"] = "🟡 Yenileniyor"
+                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"], banner=f"Yeni kanala geçiliyor ({reason})..."), get_main_panel_kb(state))
+
+                    old_ch = state["current_streamer"]
                     streamers = fetch_gta6_streamers_strict(context, state)
                     bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(streamers)
-                    open_stream(page, streamers[bot_ctx["stream_idx"]]["slug"], state, count_switch=True)
-                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state))
+                    new_ch = streamers[bot_ctx["stream_idx"]]["slug"]
+                    open_stream(page, new_ch, state, count_switch=True)
+
+                    if state.get("notify_switch", True):
+                        send_temp_message(f"🔄 <b>Kanal Değişti:</b> <code>{old_ch}</code> ({reason}) ➡️ <code>{new_ch}</code>", critical=False, state=state)
+                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"]), get_main_panel_kb(state))
                     last_video_time = -1
+
                 elif status == "frozen":
                     log(f"❄️ {state['current_streamer']} dondu, sayfa yenileniyor...")
+                    state["health_status"] = "🟡 Yenileniyor"
+                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"], banner="Oynatıcı dondu, sayfa yenileniyor..."), get_main_panel_kb(state))
                     page.reload(wait_until="domcontentloaded", timeout=35000)
                     page.wait_for_timeout(4000)
+                    state["health_status"] = "🟢 Canlı"
+                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"]), get_main_panel_kb(state))
                     last_video_time = -1
 
             # Her 15 dakikada bir Drops taraması + Sabit Pano Güncelleme
             if (time.time() - last_drops) > 900:
                 last_drops = time.time()
                 scan_and_claim_drops(context, state)
-                render_panel(state, get_main_panel_text(state, bot_ctx["start_time"]), get_main_panel_kb(state))
+                render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"]), get_main_panel_kb(state))
 
                 if state.get("stuck_scans", 0) >= 2:
                     log("🚨 Süre üst üste 2 taramada ilerlemedi! Yayıncı değiştiriliyor...")
@@ -1137,6 +1442,7 @@ def run_bot(context, state):
                     streamers = fetch_gta6_streamers_strict(context, state)
                     bot_ctx["stream_idx"] = (bot_ctx["stream_idx"] + 1) % len(streamers)
                     open_stream(page, streamers[bot_ctx["stream_idx"]]["slug"], state, count_switch=True)
+                    render_panel(state, get_main_panel_text(state, bot_ctx["start_time"], bot_ctx["session_start_ratio"]), get_main_panel_kb(state))
 
             time.sleep(1)
     finally:
@@ -1153,10 +1459,12 @@ def main():
         return
 
     state["paused"] = False
+    state["active_run_id"] = CURRENT_RUN_ID
+    state["health_status"] = "🟢 Canlı"
     state["session_count"] = state.get("session_count", 0) + 1
     save_state(state)
 
-    log(f"🚀 GTA VI Bulut Maraton Botu başlatılıyor (Oturum #{state['session_count']})...")
+    log(f"🚀 GTA VI Bulut Maraton Botu başlatılıyor (Oturum #{state['session_count']} | Run: {CURRENT_RUN_ID})...")
     crashed = False
     try:
         with sync_playwright() as p:
@@ -1172,9 +1480,9 @@ def main():
             context.close()
     except Exception as e:
         crashed = True
-        err_short = str(e)[:300]
-        log(f"💥 BEKLENMEDİK ÇÖKME: {err_short}\n{traceback.format_exc()}")
-        send_temp_message(f"💥 <b>Bot Çöktü!</b> Otomatik kurtarma (Katman 2) devreye giriyor...\n<code>{err_short}</code>", critical=True, state=state)
+        err_short = sanitize_text(str(e))[:300]
+        log(f"💥 BEKLENMEDİK ÇÖKME: {err_short}\n{sanitize_text(traceback.format_exc())}")
+        send_temp_message(f"💥 <b>Bot Çöktü!</b> Otomatik kurtarma (Katman 2) devreye giriyor...\n<code>{err_short}</code>", critical=True, state=state, auto_clean=False)
     finally:
         state = load_state()
         if crashed and not state.get("completed") and not state.get("paused"):
